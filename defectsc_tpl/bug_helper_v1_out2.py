@@ -2,14 +2,23 @@
 bug_helper_v1_out2.py — Defects4C bug helper (merged v2 + v3).
 
 Commands:
-  reproduce  <bug_id>               Full reproduce (warmup)
+  reproduce  <bug_id>               Full reproduce (warmup, run once)
   fix        <bug_id> <patch_path>  Apply & validate a patch
   checkout   <bug_id>               Checkout buggy source file
-  compile    <bug_id>               Compile (rebuild) the project
-  test       <bug_id>               Run trigger tests
+  compile    <bug_id>               Compile (returns success; warmup already built)
+  test       <bug_id>               Run trigger tests (checkout buggy → rebuild → test)
   info       <bug_id>               Print bug metadata
 
 bug_id format: project@sha  (short sha supported)
+
+Architecture:
+  warmup runs ONCE via run_reproduce.sh (builds fix + buggy).
+  After warmup, compile/test/fix all use inplace_rebuild.sh + inplace_test.sh
+  to do incremental builds. The pattern is always:
+    1. checkout/copy source file
+    2. bash inplace_rebuild.sh <build_dir> <log>
+    3. bash inplace_test.sh <build_dir> <log>
+    4. read .status / .msg / .log.xml from log dir
 """
 
 import sys
@@ -116,7 +125,7 @@ class BugsInfo:
         self.version, self.src_project_dir = detect_version(project)
         self.src_project = os.path.join(self.src_project_dir, project)
 
-        # wrk_git setup: v1 asserts existence, v0 falls back
+        # wrk_git = working tree, _git_tree = separate .git directory
         self.wrk_git = os.path.join(ROOT_DIR, project, f"git_repo_dir_{self.sha}")
         self._git_tree = os.path.join(ROOT_DIR, project, f"git_repo_dir_{self.sha}_gittree/.git")
 
@@ -148,7 +157,7 @@ class BugsInfo:
             f"Bug {sha} not found or ambiguous: {self.meta_defect}")
         self.meta_defect = self.meta_defect[0]
 
-        # Instance-level meta_info (not class-level, avoids state leaking)
+        # Instance-level meta_info
         self.meta_info = {
             "apt_install_fn": apt_install_tool(),
             "cpu_count": max((os.cpu_count() or 2) - 1, 1),
@@ -166,7 +175,6 @@ class BugsInfo:
                    (jmespath.search("c_compile.test_flags", self.meta_defect) or []))
         compile_kwargs = {"build_flags": b_flags, "test_flags": t_flags}
 
-        # v0 additionally merges env flags
         if self.version == "v0":
             e_flags = ((jmespath.search("env", self.meta_project) or []) +
                        (jmespath.search("c_compile.env", self.meta_defect) or []))
@@ -185,9 +193,12 @@ class BugsInfo:
             "src_file":   jmespath.search("files.src[0]", self.meta_defect),
         })
 
-    # ------------------------------------------------------------------
-    # Internal helper: render a Jinja template and write to save_path
-    # ------------------------------------------------------------------
+    def _git_cmd_prefix(self):
+        """Return git command prefix with --git-dir and --work-tree if separate git tree exists."""
+        if os.path.isdir(self._git_tree):
+            return f"git --git-dir={self._git_tree} --work-tree={self.wrk_git}"
+        return "git"
+
     def _build_tpl(self, tpl_path, dict_info, save_path):
         loader_dir = self.src_project
         if tpl_path.startswith("/"):
@@ -197,9 +208,6 @@ class BugsInfo:
         with open(save_path, "w") as f:
             f.write(template.render(**dict_info))
 
-    # ------------------------------------------------------------------
-    # Resolve build / test template paths
-    # ------------------------------------------------------------------
     def _build_tpl_path(self):
         val = self.meta_info.get("build", "")
         return (val if ".jinja" in str(val)
@@ -210,9 +218,6 @@ class BugsInfo:
         return (val if ".jinja" in str(val)
                 else os.path.abspath(opj(self.src_project_dir, "common_test_tpl.jinja")))
 
-    # ------------------------------------------------------------------
-    # Workflow template varies by version
-    # ------------------------------------------------------------------
     def _workflow_reproduce_tpl(self):
         if self.version == "v0":
             return os.path.join(SRC_DIR, "projects", "workflow_tpl.jinja")
@@ -223,7 +228,6 @@ class BugsInfo:
             return os.path.join(SRC_DIR, "projects", "workflow_cmake_rebuild_tpl.jinja")
         return os.path.join(SRC_DIR, "projects_v1", "workflow_cmake_rebuild_tpl.jinja")
 
-    # ------------------------------------------------------------------
     def set_reproduce_build(self):
         rebuild_info = {
             "is_rebuild": True,
@@ -241,8 +245,28 @@ class BugsInfo:
                         os.path.join(self.wrk_git, "inplace_rebuild.sh"))
         self._build_tpl(self._test_tpl_path(), self.meta_info,
                         os.path.join(self.wrk_git, "inplace_test.sh"))
-        self._build_tpl(self._workflow_reproduce_tpl(), reproduce_info ,
+        self._build_tpl(self._workflow_reproduce_tpl(), reproduce_info,
                         os.path.join(self.wrk_git, "run_reproduce.sh"))
+
+    def set_trigger_build(self, regression=False):
+        """Render inplace_rebuild.sh and inplace_test.sh for trigger/regression tests.
+
+        regression=True → empty test_flags (run ALL tests)
+        regression=False → use configured test_flags (filtered)
+        """
+        test_info = dict(self.meta_info)
+        if regression:
+            test_info["test_flags"] = []
+
+        rebuild_info = {
+            "is_rebuild": True,
+            "test_log": os.path.join(self.wrk_log, f"test_{self.sha}_fix.log"),
+            **self.meta_info,
+        }
+        self._build_tpl(self._build_tpl_path(), rebuild_info,
+                        os.path.join(self.wrk_git, "inplace_rebuild.sh"))
+        self._build_tpl(self._test_tpl_path(), test_info,
+                        os.path.join(self.wrk_git, "inplace_test.sh"))
 
     def set_patch_build(self):
         rebuild_info = {
@@ -291,16 +315,41 @@ def exec_cmd(cmd_info):
     return subprocess.run(one_cmd, **cmd_info)
 
 
+def _read_status_file(log_path):
+    """Read the .status file generated by inplace_test.sh."""
+    status_path = log_path.replace(".log", ".status")
+    if os.path.isfile(status_path):
+        try:
+            with open(status_path) as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _read_log_tail(log_path, max_chars=2000):
+    """Read the tail of a log file."""
+    if not os.path.isfile(log_path):
+        return ""
+    try:
+        with open(log_path, encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        return content[-max_chars:] if len(content) > max_chars else content
+    except Exception:
+        return ""
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Command implementations
 # ═══════════════════════════════════════════════════════════════
 
 def cmd_reproduce(bug_id):
-    """Full reproduce via run_reproduce.sh (follows defectsc_tpl/run_reproduce.sh)."""
+    """Full reproduce via run_reproduce.sh. Run once during warmup."""
     project, sha = parse_bug_id(bug_id)
     instance = BugsInfo(project=project, sha=sha)
+    git_prefix = instance._git_cmd_prefix()
     with open(instance.wrk_log_fn, "w") as log_f:
-        exec_cmd({"cmd": f"git  --git-dir={instance._git_tree} clean -dfx   ", "cwd": instance.wrk_git,
+        exec_cmd({"cmd": f"{git_prefix} clean -dfx", "cwd": instance.wrk_git,
                    "stdout": log_f, "stderr": log_f})
         instance.set_reproduce_build()
         try:
@@ -313,12 +362,18 @@ def cmd_reproduce(bug_id):
 
 
 def cmd_fix(bug_id, patch_path):
-    """Apply patch via run_patch.sh (follows defectsc_tpl/run_patch.sh)."""
+    """Apply patch: copy patch to src_file → inplace_rebuild → inplace_test.
+
+    Uses the rendered run_patch.sh (from workflow_cmake_rebuild_tpl.jinja)
+    which handles: cp patch → src_file, rebuild, test, write log/status/msg.
+    """
     project, sha = parse_bug_id(bug_id)
     assert os.path.isfile(patch_path), f"Patch not found: {patch_path}"
     instance = BugsInfo(project=project, sha=sha)
+    instance.set_patch_build()
+
+    # run_patch.sh takes patch_file as $1
     with open(instance.wrk_log_fn, "a") as log_f:
-        instance.set_patch_build()
         try:
             exec_cmd({"cmd": f"bash run_patch.sh {patch_path}", "cwd": instance.wrk_git,
                        "stdout": log_f, "stderr": log_f, "timeout": 1800})
@@ -332,25 +387,29 @@ def cmd_checkout(bug_id):
     project, sha = parse_bug_id(bug_id)
     instance = BugsInfo(project=project, sha=sha)
     repo_dir = instance.wrk_git
-    git_tree_dir = instance._git_tree 
+    git_prefix = instance._git_cmd_prefix()
 
     src_file = instance.meta_info.get("src_file", "")
     commit_before = instance.meta_defect.get("commit_before", "")
-    if not ( os.path.isdir(os.path.join(repo_dir, ".git")) or  os.path.isdir(os.path.join(git_tree_dir, ".git"))  ) :
+
+    has_git = os.path.isdir(os.path.join(repo_dir, ".git")) or os.path.isdir(instance._git_tree)
+    if not has_git:
         print(f"ERROR: no .git in {repo_dir}. Run warmup first.", file=sys.stderr)
         return {"returncode": 1}
-    r = subprocess.run(f"git cat-file -t {commit_before}  --git-dir={instance._git_tree}", shell=True, cwd=repo_dir,
+
+    r = subprocess.run(f"{git_prefix} cat-file -t {commit_before}", shell=True, cwd=repo_dir,
                        capture_output=True, encoding="utf-8")
     if r.returncode != 0:
-        r2 = subprocess.run(f"git rev-parse {sha}~1  --git-dir={instance._git_tree}", shell=True, cwd=repo_dir,
+        r2 = subprocess.run(f"{git_prefix} rev-parse {sha}~1", shell=True, cwd=repo_dir,
                             capture_output=True, encoding="utf-8")
         if r2.returncode == 0 and r2.stdout.strip():
             commit_before = r2.stdout.strip()
         else:
             print(f"ERROR: commit_before unreachable for {sha[:12]}", file=sys.stderr)
             return {"returncode": 1}
-    cmd = (f"git checkout -f {commit_before} -- {src_file}  --git-dir={instance._git_tree}"
-           if src_file else f"git checkout -f {commit_before}  --git-dir={instance._git_tree} ")
+
+    cmd = (f"{git_prefix} checkout -f {commit_before} -- {src_file}"
+           if src_file else f"{git_prefix} checkout -f {commit_before}")
     r = subprocess.run(cmd, shell=True, cwd=repo_dir,
                        capture_output=True, encoding="utf-8")
     if r.returncode != 0:
@@ -362,59 +421,92 @@ def cmd_checkout(bug_id):
 
 
 def cmd_compile(bug_id):
-    """Compile: generates build scripts, runs inplace_build.sh."""
+    """Compile: returns success. Warmup already built the project.
+
+    The actual rebuild happens inside cmd_test/cmd_fix via inplace_rebuild.sh.
+    """
     project, sha = parse_bug_id(bug_id)
     instance = BugsInfo(project=project, sha=sha)
-    instance.set_reproduce_build()
-    log_path = os.path.join(instance.wrk_log, f"compile_{sha}.log")
-    build_dir = instance.meta_info["build_dir"]
-    r = subprocess.run(
-        f"bash inplace_build.sh {build_dir} {log_path}",
-        shell=True, cwd=instance.wrk_git,
-        capture_output=True, encoding="utf-8", errors="replace", timeout=1800)
-    print(r.stdout, end="")
-    if r.stderr:
-        print(r.stderr, end="", file=sys.stderr)
-    if r.returncode != 0:
-        print(f"COMPILE FAILED (rc={r.returncode})", file=sys.stderr)
-    return {"returncode": r.returncode, "log_file": log_path}
+    build_dir_path = os.path.join(instance.wrk_git, f"build_{sha}")
+    if os.path.isdir(build_dir_path):
+        return {"returncode": 0, "log_file": "",
+                "stdout": f"Build dir exists: {build_dir_path}\n"
+                          f"Warmup already compiled. Rebuild happens in test/fix.\n"}
+    else:
+        return {"returncode": 1, "log_file": "",
+                "stderr": f"Build dir not found: {build_dir_path}. Run warmup first.\n"}
 
 
 def cmd_test(bug_id, regression=False):
-    """Run tests via inplace_test.sh.
+    """Run tests: checkout buggy → inplace_rebuild → inplace_test.
+
+    This follows the same pattern as run_patch (workflow_cmake_rebuild_tpl.jinja)
+    but instead of copying a patch file, it checks out the buggy source via git.
 
     regression=False → trigger tests (filtered by test_flags)
     regression=True  → all tests (no filter)
     """
     project, sha = parse_bug_id(bug_id)
     instance = BugsInfo(project=project, sha=sha)
+    git_prefix = instance._git_cmd_prefix()
 
-    if regression:
-        # Regression: override test_flags to empty so inplace_test.sh runs all
-        instance.meta_info["test_flags"] = []
+    label = "regression" if regression else "trigger"
+    log_path = os.path.join(instance.wrk_log, f"{label}_{sha}.log")
 
-    instance.set_reproduce_build()
-    log_path = os.path.join(instance.wrk_log, f"test_{sha}_{'regression' if regression else 'trigger'}.log")
+    # Step 1: Render build/test scripts with appropriate test_flags
+    instance.set_trigger_build(regression=regression)
+
+    # Step 2: Checkout buggy source (commit_before)
+    src_file = instance.meta_info.get("src_file", "")
+    commit_before = instance.meta_defect.get("commit_before", "")
+
+    if src_file and commit_before:
+        r = subprocess.run(
+            f"{git_prefix} checkout -f {commit_before} -- {src_file}",
+            shell=True, cwd=instance.wrk_git,
+            capture_output=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            # Fallback: try parent of commit_after
+            r2 = subprocess.run(
+                f"{git_prefix} rev-parse {sha}~1",
+                shell=True, cwd=instance.wrk_git,
+                capture_output=True, encoding="utf-8")
+            if r2.returncode == 0 and r2.stdout.strip():
+                commit_before = r2.stdout.strip()
+                subprocess.run(
+                    f"{git_prefix} checkout -f {commit_before} -- {src_file}",
+                    shell=True, cwd=instance.wrk_git,
+                    capture_output=True, encoding="utf-8", errors="replace")
+
+    # Step 3: Rebuild (incremental via ninja)
     build_dir = instance.meta_info["build_dir"]
-    r = subprocess.run(
+    rebuild_r = subprocess.run(
+        f"bash inplace_rebuild.sh {build_dir} {log_path}",
+        shell=True, cwd=instance.wrk_git,
+        capture_output=True, encoding="utf-8", errors="replace", timeout=1800)
+
+    if rebuild_r.returncode != 0:
+        print(rebuild_r.stderr, end="", file=sys.stderr)
+        return {"returncode": rebuild_r.returncode, "passed": False,
+                "log_file": log_path, "step": "rebuild",
+                "stdout": rebuild_r.stdout, "stderr": rebuild_r.stderr}
+
+    # Step 4: Run tests
+    test_r = subprocess.run(
         f"bash inplace_test.sh {build_dir} {log_path}",
         shell=True, cwd=instance.wrk_git,
         capture_output=True, encoding="utf-8", errors="replace", timeout=1800)
-    print(r.stdout, end="")
-    if r.stderr:
-        print(r.stderr, end="", file=sys.stderr)
-    combined = r.stdout + r.stderr
-    # Read the log file for status check (inplace_test.sh writes to the log)
-    if os.path.isfile(log_path):
-        try:
-            with open(log_path) as f:
-                combined += f.read()
-        except Exception:
-            pass
-    passed = "100% tests passed" in combined or "success" in combined.lower()
-    label = "REGRESSION" if regression else "TRIGGER"
-    print(f"{label} TESTS: {'PASS' if passed else 'FAIL'}")
-    return {"returncode": r.returncode, "passed": passed, "log_file": log_path}
+
+    # Step 5: Read status from log files
+    status = _read_status_file(log_path)
+    log_tail = _read_log_tail(log_path)
+    passed = "success" in status.lower() or "100% tests passed" in log_tail
+
+    print(f"{label.upper()} TESTS: {'PASS' if passed else 'FAIL'}")
+    return {"returncode": test_r.returncode, "passed": passed,
+            "log_file": log_path, "status": status,
+            "stdout": log_tail[-500:] if log_tail else test_r.stdout,
+            "stderr": test_r.stderr}
 
 
 def cmd_info(bug_id):

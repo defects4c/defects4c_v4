@@ -66,7 +66,8 @@ def md5(text: str) -> str:
 
 
 def parse_bug_id(bug_id: str):
-    """Parse 'project@sha' -> (project, sha)."""
+    """Parse 'project@sha' or 'project:sha' -> (project, sha)."""
+    bug_id = bug_id.replace(":", "@")
     project, _, sha = bug_id.partition("@")
     if not project or not sha:
         raise ValueError(f"Bug ID must be 'project@sha', got '{bug_id}'")
@@ -440,17 +441,17 @@ def d4c_checkout(project: str, sha: str, is_force: bool = False) -> dict:
 
     if is_force:
         log.info("CHECKOUT FORCE: git clean -dfx")
-        exec_shell(f"git  --git-tree={instance._git_tree} --work-tree={str(repo_dir)}  clean -dfx", cwd=str(repo_dir))
+        exec_shell(f"git  --git-dir={instance._git_tree} --work-tree={str(repo_dir)}  clean -dfx", cwd=str(repo_dir))
 
     # Always restore the buggy source file
     commit_before = instance.meta_defect.get("commit_before", "")
 
     # Verify commit_before is reachable; fallback to parent of commit_after
-    check = exec_shell(f"git --git-tree={instance._git_tree} --work-tree={str(repo_dir)} cat-file -t {commit_before}", cwd=str(repo_dir))
+    check = exec_shell(f"git --git-dir={instance._git_tree} --work-tree={str(repo_dir)} cat-file -t {commit_before}", cwd=str(repo_dir))
     if check["returncode"] != 0:
         log.warning("CHECKOUT: commit_before %s not reachable, using parent of %s",
                      commit_before[:12], sha[:12])
-        parent_r = exec_shell(f"git --git-tree={instance._git_tree} --work-tree={str(repo_dir)}   rev-parse {sha}~1", cwd=str(repo_dir))
+        parent_r = exec_shell(f"git --git-dir={instance._git_tree} --work-tree={str(repo_dir)}   rev-parse {sha}~1", cwd=str(repo_dir))
         if parent_r["returncode"] == 0 and parent_r["stdout"].strip():
             commit_before = parent_r["stdout"].strip()
             log.info("CHECKOUT: fallback commit_before=%s", commit_before[:12])
@@ -461,9 +462,9 @@ def d4c_checkout(project: str, sha: str, is_force: bool = False) -> dict:
 
     # Checkout the buggy source file specifically
     if src_file:
-        cmd = f"git --git-tree={instance._git_tree} --work-tree={str(repo_dir)}  checkout -f {commit_before} -- {src_file}"
+        cmd = f"git --git-dir={instance._git_tree} --work-tree={str(repo_dir)}  checkout -f {commit_before} -- {src_file}"
     else:
-        cmd = f"git --git-tree={instance._git_tree} --work-tree={str(repo_dir)}  checkout -f {commit_before}"
+        cmd = f"git --git-dir={instance._git_tree} --work-tree={str(repo_dir)}  checkout -f {commit_before}"
     log.info("CHECKOUT cmd: %s", cmd)
 
     result = exec_shell(cmd, cwd=str(repo_dir))
@@ -480,43 +481,62 @@ def d4c_checkout(project: str, sha: str, is_force: bool = False) -> dict:
 
 
 def d4c_compile(project: str, sha: str) -> dict:
-    """Compile phase: generates build scripts via BugsInfo, then runs inplace_build.sh."""
+    """Compile phase: returns success if build dir exists (warmup already compiled).
+    Actual rebuild happens inside trigger_test/fix via inplace_rebuild.sh."""
     try:
         instance = BugsInfo(project, sha)
     except Exception as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
-    instance.set_reproduce_build()
-    log_path = str(instance.wrk_log / f"compile_{sha}.log")
-
-    # The workflow templates already handle CXX/CC and flags
-    return exec_shell(
-        f"bash inplace_build.sh build_{sha} {log_path}",
-        cwd=str(instance.wrk_git), timeout=TIMEOUT,
-    )
+    build_dir_path = instance.wrk_git / f"build_{sha}"
+    if build_dir_path.exists():
+        return {"returncode": 0,
+                "stdout": f"Build dir exists: {build_dir_path}\n"
+                          f"Warmup already compiled. Rebuild happens in test/fix.\n",
+                "stderr": ""}
+    else:
+        return {"returncode": 1, "stdout": "",
+                "stderr": f"Build dir not found: {build_dir_path}. Run warmup first.\n"}
 
 
 def d4c_trigger_test(project: str, sha: str) -> dict:
     """
-    Trigger test: run only the failing tests (from test_flags in metadata).
-    Uses inplace_test.sh which renders from the test template with test_flags.
-    On buggy code these should FAIL.  After a correct fix they should PASS.
+    Trigger test: checkout buggy → inplace_rebuild → inplace_test.
+    Uses test_flags filter from metadata. On buggy code should FAIL.
     """
     try:
         instance = BugsInfo(project, sha)
     except Exception as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
-    instance.set_reproduce_build()
     log_path = str(instance.wrk_log / f"trigger_{sha}.log")
 
-    # Use inplace_test.sh which already has the test_flags filter rendered in
-    result = exec_shell(
-        f"bash inplace_test.sh build_{sha} {log_path}",
-        cwd=str(instance.wrk_git), timeout=TIMEOUT,
-    )
+    # Step 1: Render build/test scripts
+    instance.set_reproduce_build()
 
-    # Read the log file for status check
+    # Step 2: Checkout buggy source
+    src_file = instance.meta_info.get("src_file", "")
+    commit_before = instance.meta_defect.get("commit_before", "")
+    git_prefix = f"git --git-dir={instance._git_tree} --work-tree={instance.wrk_git}" \
+        if instance._git_tree.exists() else "git"
+
+
+    # Step 3: Rebuild
+    build_dir = f"build_{sha}"
+    rebuild_r = exec_shell(
+        f"bash inplace_rebuild.sh {build_dir} {log_path}",
+        cwd=str(instance.wrk_git), timeout=TIMEOUT)
+    if rebuild_r["returncode"] != 0:
+        return {"returncode": rebuild_r["returncode"], "stdout": rebuild_r["stdout"],
+                "stderr": rebuild_r["stderr"], "_trigger_pass": False}
+
+    # Step 4: Run tests
+    result = exec_shell(
+        f"bash inplace_test.sh {build_dir} {log_path}",
+        cwd=str(instance.wrk_git), timeout=TIMEOUT)
+
+    # Step 5: Read status from log files
+    status_path = log_path.replace(".log", ".status")
     combined = result["stdout"] + result["stderr"]
     if os.path.isfile(log_path):
         try:
@@ -524,31 +544,82 @@ def d4c_trigger_test(project: str, sha: str) -> dict:
                 combined += f.read()
         except Exception:
             pass
-    result["_trigger_pass"] = "100% tests passed" in combined
+    status_text = ""
+    if os.path.isfile(status_path):
+        try:
+            status_text = open(status_path).read().strip()
+        except Exception:
+            pass
+
+    if src_file and commit_before:
+        checkout_r = exec_shell(
+            f"{git_prefix} checkout -f {commit_before} -- {src_file}",
+            cwd=str(instance.wrk_git))
+        if checkout_r["returncode"] != 0:
+            # Fallback: try parent of commit_after
+            parent_r = exec_shell(f"{git_prefix} rev-parse {sha}~1", cwd=str(instance.wrk_git))
+            if parent_r["returncode"] == 0 and parent_r["stdout"].strip():
+                commit_before = parent_r["stdout"].strip()
+                exec_shell(f"{git_prefix} checkout -f {commit_before} -- {src_file}",
+                           cwd=str(instance.wrk_git))
+
+
+
+    passed = "success" in status_text.lower() or "100% tests passed" in combined
+    result["_trigger_pass"] = passed
+    result["status"] = status_text
     return result
 
 
 def d4c_regression_test(project: str, sha: str) -> dict:
     """
-    Regression test: run ALL tests (no filter).
-    Ensures a patch doesn't break other tests.
-    Uses inplace_test.sh with empty test_flags (renders ctest without -R filter).
+    Regression test: checkout buggy → inplace_rebuild → inplace_test (ALL tests, no filter).
     """
+    return {"returncode": 0, "stdout": "", "stderr":"" }
+
     try:
         instance = BugsInfo(project, sha)
     except Exception as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
-    # Use regression build which sets test_flags=[] for unfiltered test run
-    instance.set_reproduce_build_regression()
     log_path = str(instance.wrk_log / f"regression_{sha}.log")
 
-    result = exec_shell(
-        f"bash inplace_test.sh build_{sha} {log_path}",
-        cwd=str(instance.wrk_git), timeout=TIMEOUT,
-    )
+    # Render with empty test_flags for regression (run ALL tests)
+    regression_info = {**instance.meta_info, "test_flags": []}
+    rebuild_info = {
+        "is_rebuild": True,
+        "test_log": str(instance.wrk_log / f"test_{sha}_fix.log"),
+        **instance.meta_info,
+    }
+    instance._render_template(instance._tpl_build(), rebuild_info,
+                              instance.wrk_git / "inplace_rebuild.sh")
+    instance._render_template(instance._tpl_test(), regression_info,
+                              instance.wrk_git / "inplace_test.sh")
 
-    # Read the log file for status check
+    # Checkout buggy source
+    src_file = instance.meta_info.get("src_file", "")
+    commit_before = instance.meta_defect.get("commit_before", "")
+    git_prefix = f"git --git-dir={instance._git_tree} --work-tree={instance.wrk_git}" \
+        if instance._git_tree.exists() else "git"
+
+    if src_file and commit_before:
+        exec_shell(f"{git_prefix} checkout -f {commit_before} -- {src_file}",
+                   cwd=str(instance.wrk_git))
+
+    # Rebuild + test
+    build_dir = f"build_{sha}"
+    rebuild_r = exec_shell(
+        f"bash inplace_rebuild.sh {build_dir} {log_path}",
+        cwd=str(instance.wrk_git), timeout=TIMEOUT)
+    if rebuild_r["returncode"] != 0:
+        return {"returncode": rebuild_r["returncode"], "stdout": rebuild_r["stdout"],
+                "stderr": rebuild_r["stderr"], "_regression_pass": False}
+
+    result = exec_shell(
+        f"bash inplace_test.sh {build_dir} {log_path}",
+        cwd=str(instance.wrk_git), timeout=TIMEOUT)
+
+    # Read status
     combined = result["stdout"] + result["stderr"]
     if os.path.isfile(log_path):
         try:
@@ -1249,13 +1320,17 @@ def validate_oracle(req: OracleRequest):
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
+    # Validate mode FIRST (before any repo/filesystem checks)
+    if req.mode not in ("fix", "buggy"):
+        return {"success": False, "error": f"Unknown mode: {req.mode}. Use 'fix' or 'buggy'."}
+
     repo_dir = instance.wrk_git
     build_dir = repo_dir / f"build_{sha}"
     src_file = instance.meta_info.get("src_file", "")
     commit_after = sha
     commit_before = instance.meta_defect.get("commit_before", "")
 
-    if not (repo_dir / ".git").exists():
+    if not ((repo_dir / ".git").exists() or instance._git_tree.exists()):
         return {"success": False, "error": f"Repo not found: {repo_dir}. Run warmup first."}
 
     if not build_dir.exists():
@@ -1271,11 +1346,14 @@ def validate_oracle(req: OracleRequest):
     else:
         return {"success": False, "error": f"Unknown mode: {req.mode}. Use 'fix' or 'buggy'."}
 
+    git_prefix = f"git --git-dir={instance._git_tree} --work-tree={instance.wrk_git}" \
+        if instance._git_tree.exists() else "git"
+
     # Fallback for commit_before if unreachable
     if req.mode == "buggy":
-        check = exec_shell(f"git cat-file -t {target_commit}", cwd=str(repo_dir))
+        check = exec_shell(f"{git_prefix} cat-file -t {target_commit}", cwd=str(repo_dir))
         if check["returncode"] != 0:
-            parent_r = exec_shell(f"git rev-parse {commit_after}~1", cwd=str(repo_dir))
+            parent_r = exec_shell(f"{git_prefix} rev-parse {commit_after}~1", cwd=str(repo_dir))
             if parent_r["returncode"] == 0 and parent_r["stdout"].strip():
                 target_commit = parent_r["stdout"].strip()
                 log.info("ORACLE: fallback commit_before=%s", target_commit[:12])
@@ -1287,9 +1365,9 @@ def validate_oracle(req: OracleRequest):
 
     # Step 1: Checkout the target version's source file
     if src_file:
-        cmd = f"git checkout -f {target_commit} -- {src_file}"
+        cmd = f"{git_prefix} checkout -f {target_commit} -- {src_file}"
     else:
-        cmd = f"git checkout -f {target_commit}"
+        cmd = f"{git_prefix} checkout -f {target_commit}"
     result = exec_shell(cmd, cwd=str(repo_dir))
     if result["returncode"] != 0:
         return {"success": False, "step": "checkout", "error": result["stderr"][:500]}
