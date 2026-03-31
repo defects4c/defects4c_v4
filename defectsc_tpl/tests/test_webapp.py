@@ -251,12 +251,15 @@ class TestMockApiExec:
         assert "returncode" in data
 
     def test_trigger_test_via_exec(self, client, first_bug):
-        """test -p <project> -v <sha> → trigger test"""
+        """test -p <project> -v <sha> → trigger test (async, returns handle)"""
         project, sha = first_bug.split("@")
         r = client.post("/api/exec",
                          json={"args": ["test", "-p", project, "-v", sha]})
         data = r.json()
         assert "returncode" in data
+        # Async: returns handle and log_paths
+        if "handle" in data:
+            assert "log_paths" in data
 
     def test_regression_test_via_exec(self, client, first_bug):
         """test -r -p <project> -v <sha> → regression test"""
@@ -339,7 +342,8 @@ class TestMockTriggerTest:
     def test_trigger_test_endpoint(self, client, first_bug):
         r = client.post("/trigger_test", json={"bug_id": first_bug})
         data = r.json()
-        assert "returncode" in data
+        assert "handle" in data
+        assert "log_paths" in data
 
 
 class TestMockRegressionTest:
@@ -541,7 +545,7 @@ class TestMockOracleValidation:
         })
         data = r.json()
         assert data["success"] is False
-        assert "Unknown mode" in data["error"]
+        assert "Unknown mode" in data.get("error", "")
 
 
 # ═══════════════════════════════════════════════════════════════════
