@@ -16,7 +16,7 @@ Usage:
 import json, os, random, sys, time
 import requests
 
-BASE = os.getenv("DEFECTS4C_URL", "http://127.0.0.1:8092")
+BASE = os.getenv("DEFECTS4C_URL", "http://127.0.0.1:8095")
 
 
 def _step(n, t): print(f"\n{'='*60}\n  Step {n}: {t}\n{'='*60}")

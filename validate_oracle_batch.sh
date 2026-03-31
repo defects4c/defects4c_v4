@@ -16,7 +16,7 @@ set -uo pipefail
 #   bash validate_oracle_batch.sh --mode patch   # only diff-as-patch
 #   bash validate_oracle_batch.sh --project danmar___cppcheck  # one project
 
-BASE_URL="${DEFECTS4C_URL:-http://127.0.0.1:8092}"
+BASE_URL="${DEFECTS4C_URL:-http://127.0.0.1:8095}"
 MODE="${1:-all}"        # all | direct | patch
 PROJECT_FILTER=""
 TIMEOUT=30
