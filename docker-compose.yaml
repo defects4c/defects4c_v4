@@ -1,0 +1,19 @@
+services:
+  defects4c:
+    build: .
+    ports:
+      - "${D4C_PORT:-8095}:11111"
+    volumes:
+      - ./out:/out
+      - ./patche_dirs:/patches
+      - ./workspace:/workspace
+      - ./defectsc_tpl:/src
+    environment:
+      - SRC_DIR=/src
+      - ROOT_DIR=/out
+      - D4C_WORKSPACE=/workspace
+      - D4C_PORT=11111
+      - D4C_TIMEOUT=1800
+      - PATCH_OUTPUT_DIR=/patches
+      - D4C_WORKERS=4
+    restart: unless-stopped

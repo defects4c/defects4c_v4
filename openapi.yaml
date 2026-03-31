@@ -1,0 +1,287 @@
+openapi: "3.0.3"
+info:
+  title: Defects4C Web API
+  version: "3.0.0"
+  description: |
+    HTTP service wrapping Defects4C (C/C++ bug benchmark).
+    D4J-compatible + native endpoints.
+servers:
+  - url: http://127.0.0.1:8092
+
+paths:
+  /health:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example: {"status": "ok"}
+
+  /api/exec:
+    post:
+      summary: Run a defects4c sub-command (D4J-compatible)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                args:
+                  type: array
+                  items: {type: string}
+                  description: Command args, e.g. ["info","-p","danmar___cppcheck","-v","caa6ff7"]
+              required: [args]
+            examples:
+              pids:
+                value: {"args": ["pids"]}
+              bids:
+                value: {"args": ["bids", "-p", "danmar___cppcheck"]}
+              info_project:
+                value: {"args": ["info", "-p", "danmar___cppcheck"]}
+              info_bug:
+                value: {"args": ["info", "-p", "danmar___cppcheck", "-v", "caa6ff7c2a6ef64df53e04701944aaa4712a1915"]}
+              checkout:
+                value: {"args": ["checkout", "-p", "danmar___cppcheck", "-v", "caa6ff7c2a6ef64df53e04701944aaa4712a1915"]}
+              compile:
+                value: {"args": ["compile", "-p", "danmar___cppcheck", "-v", "caa6ff7c2a6ef64df53e04701944aaa4712a1915"]}
+              test:
+                value: {"args": ["test", "-p", "danmar___cppcheck", "-v", "caa6ff7c2a6ef64df53e04701944aaa4712a1915"]}
+              reproduce:
+                value: {"args": ["reproduce", "-p", "danmar___cppcheck", "-v", "caa6ff7c2a6ef64df53e04701944aaa4712a1915"]}
+      responses:
+        "200":
+          description: Command result
+          content:
+            application/json:
+              example: {"returncode": 0, "stdout": "...", "stderr": ""}
+        "400":
+          description: No args provided
+        "403":
+          description: Git-mutating command blocked
+
+  /api/exec-shell:
+    post:
+      summary: Run a raw shell command
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cmd: {type: string, description: "Shell command"}
+                cwd: {type: string, description: "Working directory"}
+              required: [cmd]
+            example: {"cmd": "echo hello", "cwd": "/tmp"}
+      responses:
+        "200":
+          content:
+            application/json:
+              example: {"returncode": 0, "stdout": "hello\n", "stderr": ""}
+        "400":
+          description: No cmd provided
+        "403":
+          description: Git-mutating command blocked
+
+  /api/upload:
+    post:
+      summary: Upload a file (multipart)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                path: {type: string, description: "Destination path (relative to workspace)"}
+                file: {type: string, format: binary}
+              required: [path, file]
+      responses:
+        "200":
+          content:
+            application/json:
+              example: {"status": "ok", "path": "/workspace/test.txt"}
+        "400":
+          description: Missing path or file
+
+  /api/download:
+    get:
+      summary: Download a file
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: {type: string}
+          description: File path (relative to workspace or absolute)
+      responses:
+        "200":
+          description: File content
+        "400":
+          description: Missing path
+        "404":
+          description: File not found
+
+  /list_defects_bugid:
+    get:
+      summary: List all loaded bug IDs
+      responses:
+        "200":
+          content:
+            application/json:
+              example:
+                status: success
+                mode: mini
+                total_count: 225
+                defects: ["danmar___cppcheck@caa6ff7..."]
+
+  /get_defect/{defect_id}:
+    get:
+      summary: Get bug metadata and fault localization
+      parameters:
+        - name: defect_id
+          in: path
+          required: true
+          schema: {type: string}
+          description: "project@sha"
+      responses:
+        "200":
+          content:
+            application/json:
+              example:
+                status: success
+                bug_id: "danmar___cppcheck@caa6ff7..."
+                fl_info: {src_file: "lib/analyzerinfo.cpp", hunk_start: 10, hunk_end: 20}
+        "404":
+          description: Not found
+
+  /projects:
+    get:
+      summary: List known projects
+      responses:
+        "200":
+          content:
+            application/json:
+              example: {"projects": ["danmar___cppcheck", "curl___curl"]}
+
+  /build_patch:
+    post:
+      summary: "Build a patch from LLM output (4 methods: direct, diff, replace_json, full_file)"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bug_id: {type: string, description: "project@sha"}
+                llm_response: {type: string, description: "LLM output or patch content"}
+                method:
+                  type: string
+                  enum: [direct, diff, replace_json, full_file, auto]
+                  description: "Patch method"
+                generate_diff: {type: boolean, default: true}
+                persist_flag: {type: boolean, default: false}
+              required: [bug_id, llm_response]
+            examples:
+              direct:
+                summary: Code in markdown block
+                value:
+                  bug_id: "danmar___cppcheck@caa6ff7c2a6ef64df53e04701944aaa4712a1915"
+                  llm_response: "```cpp\nint fixed = 1;\n```"
+                  method: direct
+              diff:
+                summary: Unified diff
+                value:
+                  bug_id: "danmar___cppcheck@caa6ff7c2a6ef64df53e04701944aaa4712a1915"
+                  llm_response: "--- a/old.cpp\n+++ b/new.cpp\n@@ -1 +1 @@\n-bug\n+fix"
+                  method: diff
+              replace_json:
+                summary: Line range replacement
+                value:
+                  bug_id: "danmar___cppcheck@caa6ff7c2a6ef64df53e04701944aaa4712a1915"
+                  llm_response: '{"line_start":10,"line_end":20,"content":"// fixed\\n"}'
+                  method: replace_json
+              full_file:
+                summary: Entire file content
+                value:
+                  bug_id: "danmar___cppcheck@caa6ff7c2a6ef64df53e04701944aaa4712a1915"
+                  llm_response: "// entire file\nint main() {}\n"
+                  method: full_file
+      responses:
+        "200":
+          content:
+            application/json:
+              example: {"success": true, "md5_hash": "abc123", "fix_p": "/patches/..."}
+
+  /fix:
+    post:
+      summary: Apply & validate a patch (async)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bug_id: {type: string}
+                patch_path: {type: string, description: "Path to patch file inside container"}
+              required: [bug_id, patch_path]
+            example:
+              bug_id: "danmar___cppcheck@caa6ff7..."
+              patch_path: "/patches/danmar___cppcheck/abc123@caa6ff7___analyzerinfo.cpp"
+      responses:
+        "200":
+          content:
+            application/json:
+              example: {"handle": "abc123def456"}
+
+  /status/{handle}:
+    get:
+      summary: Poll async fix status
+      parameters:
+        - name: handle
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          content:
+            application/json:
+              example: {"status": "completed", "return_code": 0, "fix_log": "..."}
+        "404":
+          description: Handle not found
+
+  /validate_oracle:
+    post:
+      summary: "Oracle validation: checkout fix/buggy commit, rebuild, test"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bug_id: {type: string}
+                mode:
+                  type: string
+                  enum: [fix, buggy]
+                  description: "fix=checkout commit_after (expect PASS), buggy=checkout commit_before (expect FAIL)"
+              required: [bug_id, mode]
+            examples:
+              fix:
+                value: {bug_id: "danmar___cppcheck@caa6ff7...", mode: "fix"}
+              buggy:
+                value: {bug_id: "danmar___cppcheck@caa6ff7...", mode: "buggy"}
+      responses:
+        "200":
+          content:
+            application/json:
+              example:
+                success: true
+                mode: fix
+                expected: PASS
+                actual: PASS
+                matches_expectation: true
