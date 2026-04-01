@@ -1,4 +1,6 @@
-
+patche_dirs
+out
+workspace
 *$py.class
 .abstra/
 # Abstra
