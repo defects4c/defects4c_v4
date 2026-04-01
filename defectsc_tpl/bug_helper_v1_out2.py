@@ -388,8 +388,8 @@ def cmd_puretest(bug_id):
     Call cmd_checkout first to restore buggy, or cmd_fix to apply a patch.
     This just does: inplace_rebuild.sh → inplace_test.sh → read status.
 
-    Returns dict with: returncode, passed, log_file, status, stdout, stderr.
-    The log/status/xml files are left on disk for poll monitoring.
+    Returns dict with: returncode, passed, log_file, status, log_content, stderr.
+    The log/status/xml files are left on disk.
     """
     try:
         project, sha = parse_bug_id(bug_id)
@@ -397,52 +397,77 @@ def cmd_puretest(bug_id):
     except Exception as exc:
         print(f"[cmd_puretest] ERROR parsing bug_id={bug_id}: {exc}", file=sys.stderr)
         return {"returncode": 1, "passed": False, "log_file": "",
-                "stdout": "", "stderr": str(exc)}
+                "status": "", "log_content": "", "stderr": str(exc)}
 
-    log_path = instance.wrk_log_fn
-    status_path = log_path.replace(".log", ".status")
+    wrapper_log = instance.wrk_log_fn   # {sha}.log — wrapper output
+    log_dir = instance.wrk_log
 
     print(f"[cmd_puretest] START bug_id={bug_id} cwd={instance.wrk_git}", file=sys.stderr)
     instance.set_puretest_build()
     print(f"[cmd_puretest] EXEC: bash run_puretest.sh  cwd={instance.wrk_git}", file=sys.stderr)
 
     rc = 1
-    stdout_text = ""
     stderr_text = ""
-    with open(log_path, "w") as log_f:
+    with open(wrapper_log, "w") as log_f:
         try:
             r = subprocess.run(
                 shlex.split("bash run_puretest.sh"),
                 cwd=instance.wrk_git,
-                stdout=log_f, stderr=subprocess.PIPE,
+                stdout=log_f, stderr=subprocess.STDOUT,
                 encoding="utf-8", errors="replace",
                 timeout=1800,
             )
             rc = r.returncode
-            stderr_text = r.stderr or ""
         except subprocess.TimeoutExpired:
             print(f"[cmd_puretest] TIMEOUT bug_id={bug_id}", file=sys.stderr)
-            stderr_text = f"Timeout after 1800s"
+            stderr_text = "Timeout after 1800s"
 
-    print(f"[cmd_puretest] DONE bug_id={bug_id} rc={rc} log={log_path}", file=sys.stderr)
+    print(f"[cmd_puretest] DONE bug_id={bug_id} rc={rc} wrapper_log={wrapper_log}", file=sys.stderr)
 
-    # Read status file (written by inplace_test.sh)
-    status = read_status_file(status_path)
-    passed = "success" in status.lower() or rc == 0
+    # ── Find the REAL test log/status/msg files ──
+    # inplace_test.sh writes: test_{sha}_{md5}.log / .status / .msg
+    import glob as _glob
+    status_pattern = os.path.join(log_dir, f"test_{sha}_*.status")
+    status_files = sorted(_glob.glob(status_pattern), key=os.path.getmtime, reverse=True)
 
-    # Read log tail for stdout (so callers can cat it)
+    test_log_file = ""
+    test_status_file = ""
+    test_msg_file = ""
+    status_text = ""
+    log_content = ""
+
+    if status_files:
+        test_status_file = status_files[0]  # most recent
+        base = test_status_file.rsplit(".status", 1)[0]
+        test_log_file = base + ".log"
+        test_msg_file = base + ".msg"
+        status_text = read_status_file(test_status_file)
+        print(f"[cmd_puretest] Found status_file={test_status_file} status={status_text!r}", file=sys.stderr)
+    else:
+        # Fallback: try {sha}.status
+        fallback_status = wrapper_log.replace(".log", ".status")
+        status_text = read_status_file(fallback_status)
+        test_log_file = wrapper_log
+        print(f"[cmd_puretest] No test_{sha}_*.status found, fallback={fallback_status}", file=sys.stderr)
+
+    # Read the actual test log content
+    actual_log = test_log_file if os.path.isfile(test_log_file) else wrapper_log
     try:
-        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-            stdout_text = f.read()
+        with open(actual_log, "r", encoding="utf-8", errors="ignore") as f:
+            log_content = f.read()
     except Exception:
         pass
+
+    passed = "success" in status_text.lower()
 
     return {
         "returncode": rc,
         "passed": passed,
-        "log_file": log_path,
-        "status": status,
-        "stdout": stdout_text,
+        "log_file": actual_log,
+        "status_file": test_status_file or "",
+        "msg_file": test_msg_file if os.path.isfile(test_msg_file) else "",
+        "status": status_text,
+        "log_content": log_content,
         "stderr": stderr_text,
     }
 

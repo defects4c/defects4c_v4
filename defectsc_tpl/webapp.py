@@ -434,32 +434,31 @@ def d4c_compile(project: str, sha: str) -> dict:
 
 
 
-async def _run_trigger_test_async(project: str, sha: str, handle: str):
-    """Background task for trigger test."""
+def d4c_trigger_test(project: str, sha: str) -> dict:
+    """Trigger test (synchronous): pure rebuild + test via bug_helper.cmd_puretest.
+    Blocks until done, returns result with log_file, status, passed, log_content."""
     bug_id = f"{project}@{sha}"
+    log.info("[trigger_test] START bug_id=%s", bug_id)
     try:
-        tasks[handle]["status"] = "running"
-        log.info("[trigger_test] START bug_id=%s handle=%s", bug_id, handle)
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, bug_helper.cmd_puretest, bug_id)
-        #result = await asyncio.to_thread(bug_helper.cmd_puretest, bug_id)
-        passed = result.get("passed", False)
-        rc = result.get("returncode", 1)
-        log.info("[trigger_test] DONE bug_id=%s handle=%s rc=%s passed=%s log=%s",
-                 bug_id, handle, rc, passed, result.get("log_file", ""))
-        tasks[handle].update({
-            "status": "completed" if passed else "failed",
-            "return_code": rc,
-            "passed": passed,
-            "log_file": result.get("log_file", ""),
-            "test_status": result.get("status", ""),
-            "error": "" if passed else result.get("stderr", ""),
-        })
-    except Exception:
-        log.error("[trigger_test] EXCEPTION bug_id=%s handle=%s\n%s",
-                  bug_id, handle, traceback.format_exc())
-        tasks[handle]["status"] = "failed"
-        tasks[handle]["error"] = traceback.format_exc()
+        result = bug_helper.cmd_puretest(bug_id)
+    except Exception as exc:
+        log.error("[trigger_test] EXCEPTION bug_id=%s: %s", bug_id, exc)
+        return {"returncode": 1, "passed": False, "log_file": "",
+                "status": "", "log_content": "", "stderr": str(exc)}
+    passed = result.get("passed", False)
+    rc = result.get("returncode", 1)
+    log.info("[trigger_test] DONE bug_id=%s rc=%s passed=%s log=%s status=%r",
+             bug_id, rc, passed, result.get("log_file", ""), result.get("status", ""))
+    return {
+        "returncode": rc,
+        "passed": passed,
+        "log_file": result.get("log_file", ""),
+        "status_file": result.get("status_file", ""),
+        "msg_file": result.get("msg_file", ""),
+        "test_status": result.get("status", ""),
+        "log_content": result.get("log_content", ""),
+        "stderr": result.get("stderr", ""),
+    }
 
 
 def d4c_regression_test(project: str, sha: str) -> dict:
@@ -898,18 +897,13 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
                 log.info("[api/exec] cmd=test(regression) project=%s sha=%s", project, sha[:12] if sha else "?")
                 return d4c_regression_test(project, sha)
             else:
-                # Validate project before async
+                # Synchronous trigger test — blocks until done
                 if project not in PROJECTS_DIR:
                     return {"returncode": 1, "stdout": "",
                             "stderr": f"Unknown project '{project}'"}
-                # Async: return handle, run in background
-                handle = uuid.uuid4().hex
-                tasks[handle] = {"bug_id": bug_id, "sha": sha, "status": "queued"}
-                log.info("[api/exec] cmd=test QUEUED project=%s sha=%s handle=%s",
-                         project, sha[:12] if sha else "?", handle)
-                background_tasks.add_task(_run_trigger_test_async, project, sha, handle)
-                return {"returncode": 0, "handle": handle,
-                        "stdout": f"Trigger test queued: {bug_id}\n", "stderr": ""}
+                log.info("[api/exec] cmd=test project=%s sha=%s (sync)",
+                         project, sha[:12] if sha else "?")
+                return d4c_trigger_test(project, sha)
         elif cmd == "info":
             if project and sha:
                 return d4c_info(project, sha)
@@ -951,6 +945,23 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
     except Exception as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
+
+
+# ── Compat alias: /api/exec-shell → same as /api/exec with cmd field ──
+class ShellRequest(BaseModel):
+    cmd: str = ""
+    cwd: str = ""
+
+@app.post("/api/exec-shell")
+def api_exec_shell(req: ShellRequest):
+    if not req.cmd:
+        return JSONResponse({"error": "No cmd provided"}, status_code=400)
+    blocked, reason = _blocked_shell(req.cmd)
+    if blocked:
+        return JSONResponse(
+            {"returncode": 1, "stdout": "", "stderr": BLOCK_MSG.format(reason=reason)},
+            status_code=403)
+    return exec_shell(req.cmd, cwd=req.cwd or str(WORKSPACE), timeout=TIMEOUT)
 
 
 @app.post("/api/upload")
@@ -1026,7 +1037,7 @@ def compile_endpoint(req: CompileRequest):
 
 
 @app.post("/trigger_test")
-def trigger_test_endpoint(req: TriggerTestRequest, background_tasks: BackgroundTasks):
+def trigger_test_endpoint(req: TriggerTestRequest):
     try:
         project, sha = parse_bug_id(req.bug_id)
     except ValueError as e:
@@ -1034,10 +1045,7 @@ def trigger_test_endpoint(req: TriggerTestRequest, background_tasks: BackgroundT
     if project not in PROJECTS_DIR:
         return {"returncode": 1, "stdout": "",
                 "stderr": f"Unknown project '{project}'"}
-    handle = uuid.uuid4().hex
-    tasks[handle] = {"bug_id": req.bug_id, "sha": sha, "status": "queued"}
-    background_tasks.add_task(_run_trigger_test_async, project, sha, handle)
-    return {"handle": handle}
+    return d4c_trigger_test(project, sha)
 
 
 @app.post("/regression_test")

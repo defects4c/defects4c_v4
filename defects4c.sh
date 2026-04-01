@@ -14,7 +14,7 @@ Commands:
   info       -p <project> [-v <sha>]       View project/bug info
   checkout   -p <project> -v <sha> [-f]    Checkout buggy source
   compile    -p <project> -v <sha>         Check build exists (warmup)
-  test       -p <project> -v <sha>         Run trigger tests (async, polls until done)
+  test       -p <project> -v <sha>         Run trigger tests (sync, waits for result)
   test -r    -p <project> -v <sha>         Run regression tests (all)
   reproduce  -p <project> -v <sha>         Full reproduce (async, polls until done)
   shell      <shell_command>               Run arbitrary shell command in container
@@ -38,7 +38,7 @@ if ! curl -s --max-time 3 "${DEFECTS4C_URL}/health" >/dev/null 2>&1; then
     exit 127
 fi
 
-# ── Shell subcommand: send {"cmd": "...", "cwd": "..."} ──
+# ── Shell subcommand: send {"cmd": "..."} to /api/exec ──
 if [ "$1" = "shell" ]; then
     shift
     if [ $# -eq 0 ]; then
@@ -88,7 +88,7 @@ HTTP_CODE=$(curl -s -o "$TMPFILE" -w "%{http_code}" \
 
 [ "$HTTP_CODE" -ge 500 ] && { echo "ERROR: HTTP ${HTTP_CODE}" >&2; cat "$TMPFILE" >&2; exit 1; }
 
-# ── Parse response: sync vs async ──
+# ── Parse response ──
 export TMPFILE POLL_INTERVAL DEFECTS4C_URL
 python3 << 'PYEOF'
 import sys, json, time, urllib.request, os
@@ -104,13 +104,46 @@ stderr = data.get("stderr", "")
 rc = data.get("returncode", 1)
 handle = data.get("handle", "")
 
-# ── Synchronous command: print and exit ──
+# ═══════════════════════════════════════════════════════
+#  Synchronous response (test, checkout, compile, info…)
+# ═══════════════════════════════════════════════════════
 if not handle:
+    # -- trigger test returns passed/test_status/log_file/log_content directly --
+    passed = data.get("passed")
+    test_status = data.get("test_status", "")
+    log_file = data.get("log_file", "")
+    log_content = data.get("log_content", "")
+
+    if passed is not None:
+        verdict = "PASS" if passed else "FAIL"
+        sys.stdout.write(f"Result: {verdict} (rc={rc})\n")
+        if test_status:
+            sys.stdout.write(f"Test status: {test_status}\n")
+        if log_file:
+            sys.stderr.write(f"log_file={log_file}\n")
+        if data.get("status_file"):
+            sys.stderr.write(f"status_file={data['status_file']}\n")
+        if data.get("msg_file"):
+            sys.stderr.write(f"msg_file={data['msg_file']}\n")
+        # Print log content
+        if log_content:
+            sys.stdout.write("\n--- log output ---\n")
+            sys.stdout.write(log_content)
+            if not log_content.endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.write("--- end log ---\n")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.exit(0 if passed else 1)
+
+    # -- other sync commands (info, checkout, compile, etc.) --
     if stdout: sys.stdout.write(stdout); sys.stdout.flush()
     if stderr: sys.stderr.write(stderr); sys.stderr.flush()
     sys.exit(rc)
 
-# ── Async command: poll /status/{handle} until terminal ──
+# ═══════════════════════════════════════════════════════
+#  Async response (reproduce) — poll /status/{handle}
+# ═══════════════════════════════════════════════════════
 sys.stderr.write(f"[async] handle={handle} — polling for completion...\n")
 sys.stderr.flush()
 
@@ -135,22 +168,12 @@ while True:
 
     # ── Terminal state ──
     rc = status_data.get("return_code", 1)
-    passed = status_data.get("passed")
     log_file = status_data.get("log_file", "")
-    test_status = status_data.get("test_status", "")
     error = status_data.get("error", "")
 
-    # Summary line
-    if passed is not None:
-        verdict = "PASS" if passed else "FAIL"
-        sys.stdout.write(f"Result: {verdict} (rc={rc})\n")
-    else:
-        sys.stdout.write(f"Completed: status={status} rc={rc}\n")
+    sys.stdout.write(f"Completed: status={status} rc={rc}\n")
 
-    if test_status:
-        sys.stdout.write(f"Test status: {test_status}\n")
-
-    # Cat the log file via shell subcommand
+    # Cat the log file
     if log_file:
         sys.stderr.write(f"log_file={log_file}\n"); sys.stderr.flush()
         try:
@@ -179,6 +202,6 @@ while True:
         if not error.endswith("\n"):
             sys.stderr.write("\n")
 
-    sys.exit(0 if passed else rc)
+    sys.exit(rc)
 PYEOF
 
