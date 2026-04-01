@@ -218,17 +218,16 @@ class BugsInfo:
         self._build_tpl(self._workflow_reproduce_tpl(), reproduce_info,
                         os.path.join(self.wrk_git, "run_reproduce.sh"))
 
-
     def set_puretest_build(self):
-        """Render inplace_rebuild.sh + inplace_test.sh for trigger test."""
+        """Render inplace_rebuild.sh + inplace_test.sh + run_puretest.sh for trigger test."""
         rebuild_info = {"is_rebuild": True, **self.meta_info}
-        puretest_info = {**self.meta_info, "_git_tree": self._git_tree}  # ← define it
+        puretest_info = {**self.meta_info, "_git_tree": self._git_tree}
         self._build_tpl(self._build_tpl_path(), rebuild_info,
                         os.path.join(self.wrk_git, "inplace_rebuild.sh"))
         self._build_tpl(self._test_tpl_path(), self.meta_info,
                         os.path.join(self.wrk_git, "inplace_test.sh"))
-        self._build_tpl(self._workflow_puretest_tpl(), puretest_info,    # ← use it
-                    os.path.join(self.wrk_git, "run_puretest.sh"))
+        self._build_tpl(self._workflow_puretest_tpl(), puretest_info,
+                        os.path.join(self.wrk_git, "run_puretest.sh"))
 
 
     def set_patch_build(self):
@@ -388,6 +387,9 @@ def cmd_puretest(bug_id):
 
     Call cmd_checkout first to restore buggy, or cmd_fix to apply a patch.
     This just does: inplace_rebuild.sh → inplace_test.sh → read status.
+
+    Returns dict with: returncode, passed, log_file, status, stdout, stderr.
+    The log/status/xml files are left on disk for poll monitoring.
     """
     try:
         project, sha = parse_bug_id(bug_id)
@@ -396,29 +398,53 @@ def cmd_puretest(bug_id):
         print(f"[cmd_puretest] ERROR parsing bug_id={bug_id}: {exc}", file=sys.stderr)
         return {"returncode": 1, "passed": False, "log_file": "",
                 "stdout": "", "stderr": str(exc)}
-    #project, sha = parse_bug_id(bug_id)
-    #instance = BugsInfo(project=project, sha=sha)
+
+    log_path = instance.wrk_log_fn
+    status_path = log_path.replace(".log", ".status")
+
     print(f"[cmd_puretest] START bug_id={bug_id} cwd={instance.wrk_git}", file=sys.stderr)
     instance.set_puretest_build()
     print(f"[cmd_puretest] EXEC: bash run_puretest.sh  cwd={instance.wrk_git}", file=sys.stderr)
-    with open(instance.wrk_log_fn, "a") as log_f:
+
+    rc = 1
+    stdout_text = ""
+    stderr_text = ""
+    with open(log_path, "w") as log_f:
         try:
-            exec_cmd({"cmd": f"bash run_puretest.sh ", "cwd": instance.wrk_git,
-                       "stdout": log_f, "stderr": log_f, "timeout": 1800})
+            r = subprocess.run(
+                shlex.split("bash run_puretest.sh"),
+                cwd=instance.wrk_git,
+                stdout=log_f, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace",
+                timeout=1800,
+            )
+            rc = r.returncode
+            stderr_text = r.stderr or ""
         except subprocess.TimeoutExpired:
             print(f"[cmd_puretest] TIMEOUT bug_id={bug_id}", file=sys.stderr)
+            stderr_text = f"Timeout after 1800s"
 
-    print(f"[cmd_puretest] DONE bug_id={bug_id} log={instance.wrk_log_fn}", file=sys.stderr)
+    print(f"[cmd_puretest] DONE bug_id={bug_id} rc={rc} log={log_path}", file=sys.stderr)
 
-    return {"returncode": 0, "log_file": instance.wrk_log_fn}
+    # Read status file (written by inplace_test.sh)
+    status = read_status_file(status_path)
+    passed = "success" in status.lower() or rc == 0
 
-    # Read status
-    status = read_status_file(log_path.replace(".log", ".status"))
-    passed = "success" in status.lower()
-    print(f"TRIGGER TESTS: {'PASS' if passed else 'FAIL'}")
-    return {"returncode": test_r.returncode, "passed": passed,
-            "log_file": log_path, "status": status,
-            "stdout": test_r.stdout, "stderr": test_r.stderr}
+    # Read log tail for stdout (so callers can cat it)
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            stdout_text = f.read()
+    except Exception:
+        pass
+
+    return {
+        "returncode": rc,
+        "passed": passed,
+        "log_file": log_path,
+        "status": status,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+    }
 
 
 def cmd_info(bug_id):

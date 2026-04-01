@@ -396,15 +396,6 @@ def exec_shell(cmd_str: str, cwd: str, timeout: int = TIMEOUT) -> dict:
 
 # ─────────────────────────── Phase operations (delegate to bug_helper) ────
 
-def _get_trigger_log_paths(project: str, sha: str) -> dict:
-    """Return log file paths for trigger test monitoring."""
-    log_dir = OUT_ROOT / project / "logs"
-    return {
-        "log":    str(log_dir / f"trigger_{sha}.log"),
-        "msg":    str(log_dir / f"trigger_{sha}.msg"),
-        "status": str(log_dir / f"trigger_{sha}.status"),
-    }
-
 
 def d4c_checkout(project: str, sha: str, is_force: bool = False) -> dict:
     """Checkout buggy source. Delegates to bug_helper.cmd_checkout."""
@@ -441,19 +432,6 @@ def d4c_compile(project: str, sha: str) -> dict:
     except Exception as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
-
-def d4c_trigger_test(project: str, sha: str) -> dict:
-    """Trigger test (async): pure rebuild + test. src_file already in place.
-    Returns immediately with log file paths for monitoring."""
-    bug_id = f"{project}@{sha}"
-    lp = _get_trigger_log_paths(project, sha)
-    return {
-        "returncode": 0,
-        "stdout": f"Trigger test started for {bug_id}\n",
-        "stderr": "",
-        "log_paths": lp,
-        "_trigger_pass": None,  # poll status file
-    }
 
 
 async def _run_trigger_test_async(project: str, sha: str, handle: str):
@@ -613,14 +591,6 @@ def load_metadata() -> int:
     return count
 
 
-def get_log_file_paths(project: str, sha: str, patch_md5: str) -> dict:
-    log_dir = OUT_ROOT / project / "logs"
-    return {
-        "log":    str(log_dir / f"patch_{sha}_{patch_md5}.log"),
-        "msg":    str(log_dir / f"patch_{sha}_{patch_md5}.msg"),
-        "status": str(log_dir / f"patch_{sha}_{patch_md5}.status"),
-    }
-
 
 # ─────────────────────────── Patch building ──────────────────────────
 
@@ -753,7 +723,12 @@ async def run_fix_async(bug_id: str, patch_path: str, handle: str):
         instance = BugsInfo(project, sha)
 
         patch_md5 = extract_patch_md5(patch_path)
-        lp = get_log_file_paths(project, sha, patch_md5)
+        log_dir = OUT_ROOT / project / "logs"
+        lp = {
+            "log":    str(log_dir / f"patch_{sha}_{patch_md5}.log"),
+            "msg":    str(log_dir / f"patch_{sha}_{patch_md5}.msg"),
+            "status": str(log_dir / f"patch_{sha}_{patch_md5}.status"),
+        }
 
         # Check existing result
         if os.path.exists(lp["log"]):
@@ -853,10 +828,7 @@ class BuildPatchRequest(BaseModel):
 
 class ExecRequest(BaseModel):
     args: list = []
-    cwd: str = ""
-
-class ShellRequest(BaseModel):
-    cmd: str = ""
+    cmd: str = ""       # raw shell command (replaces /api/exec-shell)
     cwd: str = ""
 
 
@@ -884,9 +856,19 @@ def health():
 # ── D4J-compatible /api/exec ──
 @app.post("/api/exec")
 def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
+    # ── Raw shell mode (replaces /api/exec-shell) ──
+    if req.cmd:
+        blocked, reason = _blocked_shell(req.cmd)
+        if blocked:
+            return JSONResponse(
+                {"returncode": 1, "stdout": "", "stderr": BLOCK_MSG.format(reason=reason)},
+                status_code=403)
+        return exec_shell(req.cmd, cwd=req.cwd or str(WORKSPACE), timeout=TIMEOUT)
+
+    # ── D4J-compatible args mode ──
     args = req.args
     if not args:
-        return JSONResponse({"error": "No args provided"}, status_code=400)
+        return JSONResponse({"error": "No args or cmd provided"}, status_code=400)
 
     blocked, reason = _blocked_args(args)
     if blocked:
@@ -920,16 +902,14 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
                 if project not in PROJECTS_DIR:
                     return {"returncode": 1, "stdout": "",
                             "stderr": f"Unknown project '{project}'"}
-                # Async: return handle + log paths, run in background
+                # Async: return handle, run in background
                 handle = uuid.uuid4().hex
-                lp = _get_trigger_log_paths(project, sha)
-                tasks[handle] = {"bug_id": bug_id, "sha": sha, "status": "queued", "log_paths": lp}
-                log.info("[api/exec] cmd=test QUEUED project=%s sha=%s handle=%s log=%s",
-                         project, sha[:12] if sha else "?", handle, lp.get("log", ""))
+                tasks[handle] = {"bug_id": bug_id, "sha": sha, "status": "queued"}
+                log.info("[api/exec] cmd=test QUEUED project=%s sha=%s handle=%s",
+                         project, sha[:12] if sha else "?", handle)
                 background_tasks.add_task(_run_trigger_test_async, project, sha, handle)
                 return {"returncode": 0, "handle": handle,
-                        "stdout": f"{lp['log']}---->\n", "stderr": "",
-                        "log_paths": lp}
+                        "stdout": f"Trigger test queued: {bug_id}\n", "stderr": ""}
         elif cmd == "info":
             if project and sha:
                 return d4c_info(project, sha)
@@ -971,19 +951,6 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
     except Exception as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
-
-@app.post("/api/exec-shell")
-def api_exec_shell(req: ShellRequest):
-    if not req.cmd:
-        return JSONResponse(
-            {"error": "No cmd provided"},
-            status_code=400)
-    blocked, reason = _blocked_shell(req.cmd)
-    if blocked:
-        return JSONResponse(
-            {"returncode": 1, "stdout": "", "stderr": BLOCK_MSG.format(reason=reason)},
-            status_code=403)
-    return exec_shell(req.cmd, cwd=req.cwd or str(WORKSPACE), timeout=TIMEOUT)
 
 
 @app.post("/api/upload")
@@ -1068,10 +1035,9 @@ def trigger_test_endpoint(req: TriggerTestRequest, background_tasks: BackgroundT
         return {"returncode": 1, "stdout": "",
                 "stderr": f"Unknown project '{project}'"}
     handle = uuid.uuid4().hex
-    lp = _get_trigger_log_paths(project, sha)
-    tasks[handle] = {"bug_id": req.bug_id, "sha": sha, "status": "queued", "log_paths": lp}
+    tasks[handle] = {"bug_id": req.bug_id, "sha": sha, "status": "queued"}
     background_tasks.add_task(_run_trigger_test_async, project, sha, handle)
-    return {"handle": handle, "log_paths": lp}
+    return {"handle": handle}
 
 
 @app.post("/regression_test")
