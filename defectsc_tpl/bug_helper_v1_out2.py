@@ -19,7 +19,7 @@ Architecture:
     checkout → edit src_file → test (rebuild+run)
   - cmd_checkout: restores buggy src from git
   - cmd_fix: copies patch file into src, then rebuild+test
-  - cmd_test: just rebuild+test (src already in place, do NOT touch it)
+  - cmd_puretest: just rebuild+test (src already in place, do NOT touch it)
 """
 
 import sys
@@ -218,16 +218,17 @@ class BugsInfo:
         self._build_tpl(self._workflow_reproduce_tpl(), reproduce_info,
                         os.path.join(self.wrk_git, "run_reproduce.sh"))
 
-    def set_puretest_build(self ):
+
+    def set_puretest_build(self):
         """Render inplace_rebuild.sh + inplace_test.sh for trigger test."""
         rebuild_info = {"is_rebuild": True, **self.meta_info}
+        puretest_info = {**self.meta_info, "_git_tree": self._git_tree}  # ← define it
         self._build_tpl(self._build_tpl_path(), rebuild_info,
                         os.path.join(self.wrk_git, "inplace_rebuild.sh"))
         self._build_tpl(self._test_tpl_path(), self.meta_info,
                         os.path.join(self.wrk_git, "inplace_test.sh"))
-
-        self._build_tpl(self._workflow_puretest_tpl(), reproduce_info,
-                        os.path.join(self.wrk_git, "run_puretest.sh"))
+        self._build_tpl(self._workflow_puretest_tpl(), puretest_info,    # ← use it
+                    os.path.join(self.wrk_git, "run_puretest.sh"))
 
 
     def set_patch_build(self):
@@ -296,16 +297,19 @@ def cmd_reproduce(bug_id):
     """Full reproduce via run_reproduce.sh. Run ONCE during warmup."""
     project, sha = parse_bug_id(bug_id)
     instance = BugsInfo(project=project, sha=sha)
+    print(f"[cmd_reproduce] START bug_id={bug_id} cwd={instance.wrk_git}", file=sys.stderr)
     with open(instance.wrk_log_fn, "w") as log_f:
         exec_cmd({"cmd": f"{instance.git_prefix()} clean -dfx",
                    "cwd": instance.wrk_git, "stdout": log_f, "stderr": log_f})
         instance.set_reproduce_build()
         try:
             timeout = 3600 if "llvm" in project else 1800
+            print(f"[cmd_reproduce] EXEC: bash run_reproduce.sh (timeout={timeout}s)", file=sys.stderr)
             exec_cmd({"cmd": "bash run_reproduce.sh", "cwd": instance.wrk_git,
                        "stdout": log_f, "stderr": log_f, "timeout": timeout})
         except subprocess.TimeoutExpired:
-            print("timeout")
+            print(f"[cmd_reproduce] TIMEOUT bug_id={bug_id}", file=sys.stderr)
+    print(f"[cmd_reproduce] DONE bug_id={bug_id} log={instance.wrk_log_fn}", file=sys.stderr)
     return {"returncode": 0, "log_file": instance.wrk_log_fn}
 
 
@@ -314,13 +318,16 @@ def cmd_fix(bug_id, patch_path):
     project, sha = parse_bug_id(bug_id)
     assert os.path.isfile(patch_path), f"Patch not found: {patch_path}"
     instance = BugsInfo(project=project, sha=sha)
+    print(f"[cmd_fix] START bug_id={bug_id} patch={patch_path} cwd={instance.wrk_git}", file=sys.stderr)
     instance.set_patch_build()
     with open(instance.wrk_log_fn, "a") as log_f:
         try:
+            print(f"[cmd_fix] EXEC: bash run_patch.sh {patch_path}", file=sys.stderr)
             exec_cmd({"cmd": f"bash run_patch.sh {patch_path}", "cwd": instance.wrk_git,
                        "stdout": log_f, "stderr": log_f, "timeout": 1800})
         except subprocess.TimeoutExpired:
-            print("timeout")
+            print(f"[cmd_fix] TIMEOUT bug_id={bug_id}", file=sys.stderr)
+    print(f"[cmd_fix] DONE bug_id={bug_id} log={instance.wrk_log_fn}", file=sys.stderr)
     return {"returncode": 0, "log_file": instance.wrk_log_fn}
 
 
@@ -386,18 +393,22 @@ def cmd_puretest(bug_id):
         project, sha = parse_bug_id(bug_id)
         instance = BugsInfo(project=project, sha=sha)
     except Exception as exc:
+        print(f"[cmd_puretest] ERROR parsing bug_id={bug_id}: {exc}", file=sys.stderr)
         return {"returncode": 1, "passed": False, "log_file": "",
                 "stdout": "", "stderr": str(exc)}
     #project, sha = parse_bug_id(bug_id)
     #instance = BugsInfo(project=project, sha=sha)
+    print(f"[cmd_puretest] START bug_id={bug_id} cwd={instance.wrk_git}", file=sys.stderr)
     instance.set_puretest_build()
+    print(f"[cmd_puretest] EXEC: bash run_puretest.sh  cwd={instance.wrk_git}", file=sys.stderr)
     with open(instance.wrk_log_fn, "a") as log_f:
         try:
             exec_cmd({"cmd": f"bash run_puretest.sh ", "cwd": instance.wrk_git,
                        "stdout": log_f, "stderr": log_f, "timeout": 1800})
         except subprocess.TimeoutExpired:
-            print("timeout")
+            print(f"[cmd_puretest] TIMEOUT bug_id={bug_id}", file=sys.stderr)
 
+    print(f"[cmd_puretest] DONE bug_id={bug_id} log={instance.wrk_log_fn}", file=sys.stderr)
 
     return {"returncode": 0, "log_file": instance.wrk_log_fn}
 
@@ -457,3 +468,4 @@ if __name__ == "__main__":
     elif args.command == "compile": cmd_compile(args.bug_id)
     elif args.command == "test": cmd_puretest(args.bug_id)
     elif args.command == "info": cmd_info(args.bug_id)
+

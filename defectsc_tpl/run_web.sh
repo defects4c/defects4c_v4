@@ -19,7 +19,7 @@ exec gunicorn -k uvicorn.workers.UvicornWorker \
     --access-logfile /out/access.log \
     --error-logfile /out/error.log \
     --capture-output \
-    webapp:app
+    webapp:app   2>&1  |tee /out/exec.log 
 
 #exec gunicorn -k uvicorn.workers.UvicornWorker \
 #    --workers "${D4C_WORKERS:-4}" \

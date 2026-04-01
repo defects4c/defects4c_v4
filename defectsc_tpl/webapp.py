@@ -461,17 +461,25 @@ async def _run_trigger_test_async(project: str, sha: str, handle: str):
     bug_id = f"{project}@{sha}"
     try:
         tasks[handle]["status"] = "running"
-        result = await asyncio.to_thread(bug_helper.cmd_puretest, bug_id)
+        log.info("[trigger_test] START bug_id=%s handle=%s", bug_id, handle)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, bug_helper.cmd_puretest, bug_id)
+        #result = await asyncio.to_thread(bug_helper.cmd_puretest, bug_id)
         passed = result.get("passed", False)
+        rc = result.get("returncode", 1)
+        log.info("[trigger_test] DONE bug_id=%s handle=%s rc=%s passed=%s log=%s",
+                 bug_id, handle, rc, passed, result.get("log_file", ""))
         tasks[handle].update({
             "status": "completed" if passed else "failed",
-            "return_code": result.get("returncode", 1),
+            "return_code": rc,
             "passed": passed,
             "log_file": result.get("log_file", ""),
             "test_status": result.get("status", ""),
             "error": "" if passed else result.get("stderr", ""),
         })
     except Exception:
+        log.error("[trigger_test] EXCEPTION bug_id=%s handle=%s\n%s",
+                  bug_id, handle, traceback.format_exc())
         tasks[handle]["status"] = "failed"
         tasks[handle]["error"] = traceback.format_exc()
 
@@ -504,7 +512,10 @@ async def _run_reproduce_async(project: str, sha: str, handle: str):
     bug_id = f"{project}@{sha}"
     try:
         tasks[handle]["status"] = "running"
+        log.info("[reproduce] START bug_id=%s handle=%s", bug_id, handle)
         result = await asyncio.to_thread(bug_helper.cmd_reproduce, bug_id)
+        log.info("[reproduce] DONE bug_id=%s handle=%s rc=%s log=%s",
+                 bug_id, handle, result.get("returncode", "?"), result.get("log_file", ""))
         tasks[handle].update({
             "status": "completed",
             "return_code": result.get("returncode", 0),
@@ -512,6 +523,8 @@ async def _run_reproduce_async(project: str, sha: str, handle: str):
             "error": "",
         })
     except Exception:
+        log.error("[reproduce] EXCEPTION bug_id=%s handle=%s\n%s",
+                  bug_id, handle, traceback.format_exc())
         tasks[handle]["status"] = "failed"
         tasks[handle]["error"] = traceback.format_exc()
 
@@ -736,6 +749,7 @@ async def run_fix_async(bug_id: str, patch_path: str, handle: str):
     try:
         project, sha = parse_bug_id(bug_id)
         tasks[handle]["status"] = "running"
+        log.info("[fix] START bug_id=%s patch=%s handle=%s", bug_id, patch_path, handle)
         instance = BugsInfo(project, sha)
 
         patch_md5 = extract_patch_md5(patch_path)
@@ -743,6 +757,7 @@ async def run_fix_async(bug_id: str, patch_path: str, handle: str):
 
         # Check existing result
         if os.path.exists(lp["log"]):
+            log.info("[fix] CACHED bug_id=%s — log already exists: %s", bug_id, lp["log"])
             rc = -1
             if os.path.exists(lp["status"]):
                 try:
@@ -753,6 +768,8 @@ async def run_fix_async(bug_id: str, patch_path: str, handle: str):
                         rc = 0
                 except Exception:
                     pass
+            log.info("[fix] CACHED bug_id=%s handle=%s rc=%s status=%s",
+                     bug_id, handle, rc, "completed" if rc == 0 else "failed")
             tasks[handle].update({
                 "status": "completed" if rc == 0 else "failed",
                 "return_code": rc,
@@ -764,8 +781,11 @@ async def run_fix_async(bug_id: str, patch_path: str, handle: str):
             return
 
         lock = sha_locks.setdefault(sha, asyncio.Lock())
+        log.info("[fix] BUILDING bug_id=%s handle=%s — running _run_fix_sync", bug_id, handle)
         async with lock:
             rc = await asyncio.to_thread(_run_fix_sync, instance, patch_path, lp["log"])
+            log.info("[fix] DONE bug_id=%s handle=%s rc=%s status=%s",
+                     bug_id, handle, rc, "completed" if rc == 0 else "failed")
             tasks[handle].update({
                 "status": "completed" if rc == 0 else "failed",
                 "return_code": rc,
@@ -775,6 +795,8 @@ async def run_fix_async(bug_id: str, patch_path: str, handle: str):
                 "error": "" if rc == 0 else f"Exit code {rc}",
             })
     except Exception:
+        log.error("[fix] EXCEPTION bug_id=%s handle=%s\n%s",
+                  bug_id, handle, traceback.format_exc())
         tasks[handle]["status"] = "failed"
         tasks[handle]["error"] = traceback.format_exc()
 
@@ -782,13 +804,18 @@ async def run_fix_async(bug_id: str, patch_path: str, handle: str):
 def _run_fix_sync(instance: BugsInfo, patch_path: str, log_path: str) -> int:
     if not os.path.isfile(patch_path):
         raise FileNotFoundError(f"Patch not found: {patch_path}")
+    log.info("[fix_sync] set_patch_build project=%s sha=%s cwd=%s",
+             instance.project, instance.sha, instance.wrk_git)
     instance.set_patch_build()
+    cmd = f"bash run_patch.sh {patch_path}"
+    log.info("[fix_sync] EXEC: %s", cmd)
     with open(log_path, "a") as lf:
         proc = subprocess.run(
-            shlex.split(f"bash run_patch.sh {patch_path}"),
+            shlex.split(cmd),
             cwd=str(instance.wrk_git), stdout=lf, stderr=lf,
             timeout=TIMEOUT,
         )
+    log.info("[fix_sync] FINISHED rc=%s log=%s", proc.returncode, log_path)
     return proc.returncode
 
 
@@ -879,11 +906,14 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
 
     try:
         if cmd == "checkout":
+            log.info("[api/exec] cmd=checkout project=%s sha=%s", project, sha[:12] if sha else "?")
             return d4c_checkout(project, sha, is_force=("-f" in flags))
         elif cmd == "compile":
+            log.info("[api/exec] cmd=compile project=%s sha=%s", project, sha[:12] if sha else "?")
             return d4c_compile(project, sha)
         elif cmd == "test":
             if "-r" in flags:
+                log.info("[api/exec] cmd=test(regression) project=%s sha=%s", project, sha[:12] if sha else "?")
                 return d4c_regression_test(project, sha)
             else:
                 # Validate project before async
@@ -894,6 +924,8 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
                 handle = uuid.uuid4().hex
                 lp = _get_trigger_log_paths(project, sha)
                 tasks[handle] = {"bug_id": bug_id, "sha": sha, "status": "queued", "log_paths": lp}
+                log.info("[api/exec] cmd=test QUEUED project=%s sha=%s handle=%s log=%s",
+                         project, sha[:12] if sha else "?", handle, lp.get("log", ""))
                 background_tasks.add_task(_run_trigger_test_async, project, sha, handle)
                 return {"returncode": 0, "handle": handle,
                         "stdout": f"{lp['log']}---->\n", "stderr": "",
@@ -919,6 +951,8 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
                 handle = uuid.uuid4().hex
                 log_file = str(OUT_ROOT / project / "logs" / f"{sha}.log")
                 tasks[handle] = {"bug_id": bug_id, "sha": sha, "status": "queued", "log_file": log_file}
+                log.info("[api/exec] cmd=reproduce QUEUED project=%s sha=%s handle=%s",
+                         project, sha[:12] if sha else "?", handle)
                 background_tasks.add_task(_run_reproduce_async, project, sha, handle)
                 return {"returncode": 0, "handle": handle,
                         "stdout": f"Reproduce started: {log_file}\n", "stderr": "",
@@ -1164,6 +1198,7 @@ def fix_endpoint(req: FixRequest, background_tasks: BackgroundTasks):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     handle = uuid.uuid4().hex
+    log.info("[fix_endpoint] QUEUED bug_id=%s patch=%s handle=%s", req.bug_id, req.patch_path, handle)
     tasks[handle] = {"bug_id": req.bug_id, "sha": sha,
                      "status": "queued", "patch_path": req.patch_path}
     background_tasks.add_task(run_fix_async, req.bug_id, req.patch_path, handle)
@@ -1173,8 +1208,12 @@ def fix_endpoint(req: FixRequest, background_tasks: BackgroundTasks):
 @app.get("/status/{handle}")
 def get_status(handle: str):
     if handle not in tasks:
+        log.warning("[status] handle=%s NOT FOUND (total tasks=%d)", handle, len(tasks))
         raise HTTPException(404, "Handle not found")
-    return tasks[handle]
+    t = tasks[handle]
+    log.info("[status] handle=%s status=%s bug_id=%s rc=%s",
+             handle, t.get("status"), t.get("bug_id", "?"), t.get("return_code", "?"))
+    return t
 
 
 @app.get("/projects")
@@ -1192,8 +1231,8 @@ class OracleRequest(BaseModel):
 def validate_oracle(req: OracleRequest):
     """
     Oracle validation using bug_helper:
-    mode="fix"   → git checkout commit_after src → cmd_test → expect PASS
-    mode="buggy" → git checkout commit_before src → cmd_test → expect FAIL
+    mode="fix"   → git checkout commit_after src → cmd_puretest → expect PASS
+    mode="buggy" → git checkout commit_before src → cmd_puretest → expect FAIL
     """
     # Validate mode FIRST
     if req.mode not in ("fix", "buggy"):
@@ -1240,14 +1279,21 @@ def validate_oracle(req: OracleRequest):
         cmd = f"{gp} checkout -f {target_commit} -- {src_file}"
     else:
         cmd = f"{gp} checkout -f {target_commit}"
+    log.info("[validate_oracle] CHECKOUT mode=%s bug_id=%s@%s cmd=%s", req.mode, project, sha[:12], cmd)
     r = subprocess.run(cmd, shell=True, cwd=str(repo_dir),
                        capture_output=True, encoding="utf-8")
     if r.returncode != 0:
+        log.warning("[validate_oracle] CHECKOUT FAILED mode=%s bug_id=%s@%s stderr=%s",
+                    req.mode, project, sha[:12], r.stderr[:200])
         return {"success": False, "step": "checkout", "error": r.stderr[:500]}
 
-    # Step 2+3: Rebuild + test via bug_helper.cmd_test
+    # Step 2+3: Rebuild + test via bug_helper.cmd_puretest
     bug_id = f"{project}@{sha}"
-    test_result = bug_helper.cmd_test(bug_id)
+    log.info("[validate_oracle] mode=%s bug_id=%s target_commit=%s src_file=%s — running cmd_puretest",
+             req.mode, bug_id, target_commit[:12], src_file)
+    test_result = bug_helper.cmd_puretest(bug_id)
+    log.info("[validate_oracle] mode=%s bug_id=%s — cmd_puretest returned rc=%s",
+             req.mode, bug_id, test_result.get("returncode", "?"))
 
     passed = test_result.get("passed", False)
     actual = "PASS" if passed else "FAIL"
@@ -1275,3 +1321,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("D4C_PORT", "11111"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
