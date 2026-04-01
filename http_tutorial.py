@@ -2,7 +2,7 @@
 """
 http_tutorial.py — Defects4C HTTP API tutorial.
 
-Demonstrates all API endpoints against localhost:8092.
+Demonstrates all API endpoints against localhost:8095.
 
 Usage:
     python3 http_tutorial.py                 # full workflow (random bug)
@@ -41,12 +41,12 @@ def _get(path):
 
 
 def get_all_bugs():
-    """Get all bugs from the webapp."""
+    """Get all bugs from the webapp. Returns (all_bugs, selected_bugs)."""
     data = _get("/list_defects_bugid")
     if data.get("status") != "success":
         print(f"  ERROR: {data}")
-        return []
-    return data.get("defects", [])
+        return [], []
+    return data.get("defects", []), data.get("selected", [])
 
 
 def oracle_validate(bug_id):
@@ -141,32 +141,35 @@ def demo_d4j(bugs):
 
 
 def main():
-    bugs = get_all_bugs()
+    bugs, selected = get_all_bugs()
 
     for i, a in enumerate(sys.argv):
         if a == "--list":
-            print(f"\n  Bugs ({len(bugs)}):")
+            print(f"\n  Bugs ({len(bugs)}, selected={len(selected)}):")
             for j, b in enumerate(bugs[:20]):
-                print(f"  [{j}] {b}")
+                sel = " *" if b in selected else ""
+                print(f"  [{j}] {b}{sel}")
             if len(bugs) > 20:
                 print(f"  ... and {len(bugs)-20} more")
             return
         if a == "--oracle":
             idx = int(sys.argv[i+1]) if i+1 < len(sys.argv) else 0
-            if idx < len(bugs):
-                return oracle_validate(bugs[idx])
-            print(f"  Bug index {idx} out of range (0..{len(bugs)-1})")
+            pool = selected or bugs
+            if idx < len(pool):
+                return oracle_validate(pool[idx])
+            print(f"  Bug index {idx} out of range (0..{len(pool)-1})")
             return
-        if a == "--d4j-demo": return demo_d4j(bugs)
+        if a == "--d4j-demo": return demo_d4j(selected or bugs)
         if a == "--patch-demo":
             idx = int(sys.argv[i+1]) if i+1 < len(sys.argv) else 0
-            if idx < len(bugs):
-                return demo_patch_methods(bugs[idx])
+            pool = selected or bugs
+            if idx < len(pool):
+                return demo_patch_methods(pool[idx])
             return
         if a == "--bug":
             bug_idx = int(sys.argv[i+1]) if i+1 < len(sys.argv) else 0
 
-    # Default: full workflow
+    # Default: full workflow — prefer selected (warmed-up) bugs
     _step(0, "Health check")
     try:
         h = requests.get(f"{BASE}/health", timeout=5).json()
@@ -175,11 +178,13 @@ def main():
     except Exception as e:
         print(f"  ERROR: {e}"); return
 
-    _step(1, f"List bugs ({len(bugs)} total)")
-    if not bugs: print("  No bugs loaded"); return
-    bug_idx = locals().get("bug_idx", random.randint(0, len(bugs)-1))
-    bug_idx %= len(bugs)
-    bug_id = bugs[bug_idx]
+    pool = selected or bugs
+    _step(1, f"List bugs ({len(bugs)} total, {len(selected)} selected/warmed)")
+    if not pool: print("  No bugs loaded"); return
+
+    bug_idx = locals().get("bug_idx", random.randint(0, len(pool)-1))
+    bug_idx %= len(pool)
+    bug_id = pool[bug_idx]
     print(f"  [{bug_idx}] {bug_id}")
 
     _step(2, "Get defect metadata")

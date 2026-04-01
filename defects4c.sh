@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
-DEFECTS4C_URL="${DEFECTS4C_URL:-http://localhost:8092}"
+DEFECTS4C_URL="${DEFECTS4C_URL:-http://localhost:8095}"
 CURL_TIMEOUT="${DEFECTS4C_CURL_TIMEOUT:-1900}"
 
 if [ $# -eq 0 ]; then
@@ -12,10 +12,10 @@ Commands:
   bids       -p <project>                  List bug SHAs
   info       -p <project> [-v <sha>]       View project/bug info
   checkout   -p <project> -v <sha> [-f]    Checkout buggy source
-  compile    -p <project> -v <sha>         Compile (rebuild)
-  test       -p <project> -v <sha>         Run trigger tests
+  compile    -p <project> -v <sha>         Check build exists (warmup)
+  test       -p <project> -v <sha>         Run trigger tests (async)
   test -r    -p <project> -v <sha>         Run regression tests (all)
-  reproduce  -p <project> -v <sha>         Full reproduce
+  reproduce  -p <project> -v <sha>         Full reproduce (async)
 
 Examples:
   defects4c pids
@@ -55,6 +55,17 @@ with open('$TMPFILE') as f: data = json.load(f)
 stdout = data.get('stdout', '')
 stderr = data.get('stderr', '')
 rc = data.get('returncode', 1)
+# Show async handle if present
+handle = data.get('handle', '')
+if handle:
+    sys.stderr.write(f'handle={handle}\n')
+log_file = data.get('log_file', '')
+if log_file:
+    sys.stderr.write(f'log_file={log_file}\n')
+log_paths = data.get('log_paths', {})
+if log_paths:
+    for k,v in log_paths.items():
+        sys.stderr.write(f'{k}={v}\n')
 if stdout: sys.stdout.write(stdout); sys.stdout.flush()
 if stderr: sys.stderr.write(stderr); sys.stderr.flush()
 sys.exit(rc)

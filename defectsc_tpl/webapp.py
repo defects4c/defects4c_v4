@@ -436,7 +436,10 @@ def d4c_checkout(project: str, sha: str, is_force: bool = False) -> dict:
 
 def d4c_compile(project: str, sha: str) -> dict:
     """Check build_dir exists. Warmup already compiled."""
-    return bug_helper.cmd_compile(f"{project}@{sha}")
+    try:
+        return bug_helper.cmd_compile(f"{project}@{sha}")
+    except Exception as exc:
+        return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
 
 def d4c_trigger_test(project: str, sha: str) -> dict:
@@ -458,7 +461,7 @@ async def _run_trigger_test_async(project: str, sha: str, handle: str):
     bug_id = f"{project}@{sha}"
     try:
         tasks[handle]["status"] = "running"
-        result = await asyncio.to_thread(bug_helper.cmd_test, bug_id)
+        result = await asyncio.to_thread(bug_helper.cmd_puretest, bug_id)
         passed = result.get("passed", False)
         tasks[handle].update({
             "status": "completed" if passed else "failed",
@@ -474,7 +477,12 @@ async def _run_trigger_test_async(project: str, sha: str, handle: str):
 
 
 def d4c_regression_test(project: str, sha: str) -> dict:
-    """Regression test: stub — returns success."""
+    """Regression test: stub — validates project exists, returns success."""
+    try:
+        bug_helper.BugsInfo(project, sha)
+    except Exception as exc:
+        return {"returncode": 1, "stdout": "", "stderr": str(exc),
+                "_regression_pass": False}
     return {"returncode": 0, "stdout": "regression_test: pass (stub)\n",
             "stderr": "", "_regression_pass": True}
 
@@ -878,6 +886,10 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
             if "-r" in flags:
                 return d4c_regression_test(project, sha)
             else:
+                # Validate project before async
+                if project not in PROJECTS_DIR:
+                    return {"returncode": 1, "stdout": "",
+                            "stderr": f"Unknown project '{project}'"}
                 # Async: return handle + log paths, run in background
                 handle = uuid.uuid4().hex
                 lp = _get_trigger_log_paths(project, sha)
@@ -900,6 +912,9 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
             else:
                 return {"returncode": 1, "stdout": "", "stderr": "info requires -p project and/or -v sha"}
         elif cmd == "reproduce":
+                if project not in PROJECTS_DIR:
+                    return {"returncode": 1, "stdout": "",
+                            "stderr": f"Unknown project '{project}'"}
                 # Async: return handle, run in background
                 handle = uuid.uuid4().hex
                 log_file = str(OUT_ROOT / project / "logs" / f"{sha}.log")
@@ -1015,6 +1030,9 @@ def trigger_test_endpoint(req: TriggerTestRequest, background_tasks: BackgroundT
         project, sha = parse_bug_id(req.bug_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if project not in PROJECTS_DIR:
+        return {"returncode": 1, "stdout": "",
+                "stderr": f"Unknown project '{project}'"}
     handle = uuid.uuid4().hex
     lp = _get_trigger_log_paths(project, sha)
     tasks[handle] = {"bug_id": req.bug_id, "sha": sha, "status": "queued", "log_paths": lp}
@@ -1037,11 +1055,16 @@ def reproduce_endpoint(req: ReproduceRequest, background_tasks: BackgroundTasks)
         project, sha = parse_bug_id(req.bug_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # Validate project exists before queuing
+    if project not in PROJECTS_DIR:
+        return {"returncode": 1, "stdout": "",
+                "stderr": f"Unknown project '{project}'"}
     handle = uuid.uuid4().hex
     log_file = str(OUT_ROOT / project / "logs" / f"{sha}.log")
     tasks[handle] = {"bug_id": req.bug_id, "sha": sha, "status": "queued", "log_file": log_file}
     background_tasks.add_task(_run_reproduce_async, project, sha, handle)
-    return {"handle": handle, "log_file": log_file}
+    return {"returncode": 0, "handle": handle, "log_file": log_file,
+            "stdout": f"Reproduce started: {log_file}\n", "stderr": ""}
 
 
 # ── Selected bugs (cppcheck 2021-2022, verified: compile+fix=PASS+buggy=FAIL) ──

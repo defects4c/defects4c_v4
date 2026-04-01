@@ -200,6 +200,10 @@ class BugsInfo:
             return os.path.join(SRC_DIR, "projects", "workflow_cmake_rebuild_tpl.jinja")
         return os.path.join(SRC_DIR, "projects_v1", "workflow_cmake_rebuild_tpl.jinja")
 
+    def _workflow_puretest_tpl(self):
+        if self.version == "v0":
+            return os.path.join(SRC_DIR, "projects", "workflow_cmake_compile_test_tpl.jinja")
+        return os.path.join(SRC_DIR, "projects_v1", "workflow_cmake_compile_test_tpl.jinja")
     def set_reproduce_build(self):
         rebuild_info = {"is_rebuild": True, "_git_tree": self._git_tree,
                         "test_log": os.path.join(self.wrk_log, f"test_{self.sha}_fix.log"),
@@ -214,13 +218,17 @@ class BugsInfo:
         self._build_tpl(self._workflow_reproduce_tpl(), reproduce_info,
                         os.path.join(self.wrk_git, "run_reproduce.sh"))
 
-    def set_test_build(self, log_path):
+    def set_puretest_build(self ):
         """Render inplace_rebuild.sh + inplace_test.sh for trigger test."""
         rebuild_info = {"is_rebuild": True, **self.meta_info}
         self._build_tpl(self._build_tpl_path(), rebuild_info,
                         os.path.join(self.wrk_git, "inplace_rebuild.sh"))
         self._build_tpl(self._test_tpl_path(), self.meta_info,
                         os.path.join(self.wrk_git, "inplace_test.sh"))
+
+        self._build_tpl(self._workflow_puretest_tpl(), reproduce_info,
+                        os.path.join(self.wrk_git, "run_puretest.sh"))
+
 
     def set_patch_build(self):
         rebuild_info = {"is_rebuild": True, **self.meta_info,
@@ -318,8 +326,11 @@ def cmd_fix(bug_id, patch_path):
 
 def cmd_checkout(bug_id):
     """Checkout buggy source: git checkout -f <commit_before> -- <src_file>."""
-    project, sha = parse_bug_id(bug_id)
-    instance = BugsInfo(project=project, sha=sha)
+    try:
+        project, sha = parse_bug_id(bug_id)
+        instance = BugsInfo(project=project, sha=sha)
+    except Exception as exc:
+        return {"returncode": 1, "stdout": "", "stderr": str(exc)}
     gp = instance.git_prefix()
     src_file = instance.meta_info.get("src_file", "")
     commit_before = instance.meta_defect.get("commit_before", "")
@@ -352,42 +363,43 @@ def cmd_checkout(bug_id):
 
 def cmd_compile(bug_id):
     """Check build_dir exists. Warmup already compiled."""
-    project, sha = parse_bug_id(bug_id)
-    instance = BugsInfo(project=project, sha=sha)
+    try:
+        project, sha = parse_bug_id(bug_id)
+        instance = BugsInfo(project=project, sha=sha)
+    except Exception as exc:
+        return {"returncode": 1, "stdout": "", "stderr": str(exc)}
     build_dir_path = os.path.join(instance.wrk_git, f"build_{sha}")
     if os.path.isdir(build_dir_path):
         return {"returncode": 0, "stdout": f"Build dir exists: {build_dir_path}\n", "stderr": ""}
-    return {"returncode": 1, "stdout": "", "stderr": f"Build dir not found: {build_dir_path}. Run warmup first.\n"}
+    return {"returncode": 1, "stdout": "",
+            "stderr": f"Build dir not found: {build_dir_path}. Run warmup first.\n"}
 
 
-def cmd_test(bug_id):
+
+def cmd_puretest(bug_id):
     """Pure rebuild + test. Does NOT touch src_file — it's already in place.
 
     Call cmd_checkout first to restore buggy, or cmd_fix to apply a patch.
     This just does: inplace_rebuild.sh → inplace_test.sh → read status.
     """
-    project, sha = parse_bug_id(bug_id)
-    instance = BugsInfo(project=project, sha=sha)
-    log_path = os.path.join(instance.wrk_log, f"trigger_{sha}.log")
-    build_dir = instance.meta_info["build_dir"]
+    try:
+        project, sha = parse_bug_id(bug_id)
+        instance = BugsInfo(project=project, sha=sha)
+    except Exception as exc:
+        return {"returncode": 1, "passed": False, "log_file": "",
+                "stdout": "", "stderr": str(exc)}
+    #project, sha = parse_bug_id(bug_id)
+    #instance = BugsInfo(project=project, sha=sha)
+    instance.set_puretest_build()
+    with open(instance.wrk_log_fn, "a") as log_f:
+        try:
+            exec_cmd({"cmd": f"bash run_puretest.sh ", "cwd": instance.wrk_git,
+                       "stdout": log_f, "stderr": log_f, "timeout": 1800})
+        except subprocess.TimeoutExpired:
+            print("timeout")
 
-    # Render build/test scripts
-    instance.set_test_build(log_path)
 
-    # Rebuild (incremental via ninja)
-    rebuild_r = subprocess.run(
-        f"bash inplace_rebuild.sh {build_dir} {log_path}",
-        shell=True, cwd=instance.wrk_git,
-        capture_output=True, encoding="utf-8", errors="replace", timeout=1800)
-    if rebuild_r.returncode != 0:
-        return {"returncode": rebuild_r.returncode, "passed": False,
-                "log_file": log_path, "stdout": rebuild_r.stdout, "stderr": rebuild_r.stderr}
-
-    # Run tests
-    test_r = subprocess.run(
-        f"bash inplace_test.sh {build_dir} {log_path}",
-        shell=True, cwd=instance.wrk_git,
-        capture_output=True, encoding="utf-8", errors="replace", timeout=1800)
+    return {"returncode": 0, "log_file": instance.wrk_log_fn}
 
     # Read status
     status = read_status_file(log_path.replace(".log", ".status"))
@@ -443,5 +455,5 @@ if __name__ == "__main__":
     elif args.command == "fix": cmd_fix(args.bug_id, args.patch_path)
     elif args.command == "checkout": cmd_checkout(args.bug_id)
     elif args.command == "compile": cmd_compile(args.bug_id)
-    elif args.command == "test": cmd_test(args.bug_id)
+    elif args.command == "test": cmd_puretest(args.bug_id)
     elif args.command == "info": cmd_info(args.bug_id)

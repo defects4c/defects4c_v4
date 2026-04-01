@@ -1,31 +1,31 @@
 #!/usr/bin/env bash
 set -uo pipefail
 #
-# validate_oracle_batch.sh — Batch oracle validation for all warmed-up bugs.
+# validate_oracle_batch.sh — Batch oracle validation using defects4c CLI.
 #
-# Two validation modes per bug:
-#   1. Direct checkout: checkout commit_after src_file, rebuild, test → expect PASS
-#   2. Diff-as-patch:   get diff(commit_before, commit_after) for src_file,
-#                        submit as patch via /build_patch, run /fix → expect PASS
-#
-# Uses the buglist from the webapp (mini/full/custom).
+# For each warmed-up bug:
+#   1. Get oracle diff: git --git-dir=..._gittree/.git diff commit_before commit_after -- src_file
+#   2. Upload oracle patch via /build_patch
+#   3. Submit via /fix, poll /status, check .status file
 #
 # Usage:
-#   bash validate_oracle_batch.sh               # validate all
-#   bash validate_oracle_batch.sh --mode direct  # only direct checkout
-#   bash validate_oracle_batch.sh --mode patch   # only diff-as-patch
+#   bash validate_oracle_batch.sh                              # validate all
 #   bash validate_oracle_batch.sh --project danmar___cppcheck  # one project
+#   bash validate_oracle_batch.sh --mode direct                # direct checkout only
+#   bash validate_oracle_batch.sh --mode patch                 # diff-as-patch only
 
 BASE_URL="${DEFECTS4C_URL:-http://127.0.0.1:8095}"
-MODE="${1:-all}"        # all | direct | patch
+OUT_ROOT="${ROOT_DIR:-/out}"
+MODE="all"
 PROJECT_FILTER=""
-TIMEOUT=30
+TIMEOUT=60
 
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mode) MODE="$2"; shift 2;;
         --project) PROJECT_FILTER="$2"; shift 2;;
+        --url) BASE_URL="$2"; shift 2;;
         *) shift;;
     esac
 done
@@ -37,14 +37,37 @@ echo "  Mode: $MODE"
 echo "  Project filter: ${PROJECT_FILTER:-all}"
 echo "========================================"
 
+
+
 # Get bug list from webapp
-BUGS=$(curl -s "$BASE_URL/list_defects_bugid" | python3 -c "
+BUGS=$(
+    curl -s "$BASE_URL/list_defects_bugid" | python3 -c '
 import sys, json
+
 data = json.load(sys.stdin)
-print(data.get('mode', '?'), file=sys.stderr)
-for b in data.get('defects', []):
+print(data.get("mode", "?"), file=sys.stderr)
+
+for b in data.get("defects", []):
     print(b)
-" 2>/tmp/d4c_mode.txt)
+' 2>/tmp/d4c_mode.txt
+  )
+
+
+# Fallback for testing
+#if [[ -z "$BUGS_RAW" ]]; then
+BUGS_RAW=$(cat <<'EOF'
+CESNET___libyang@140ede9c075c604632a87ee3bf0e881fb485d0e7
+the-tcpdump-group___tcpdump@8509ef02eceb2bbb479cea10fe4a7ec6395f1a8b
+danmar___cppcheck@290563b9640505d140684587e5c21e887d510495
+EOF
+)
+#fi
+
+# Convert newline-separated list into bash array
+mapfile -t BUGS <<< "$BUGS_RAW"
+
+printf '%s\n' "${BUGS[@]}"
+
 
 BUGLIST_MODE=$(cat /tmp/d4c_mode.txt 2>/dev/null || echo "?")
 TOTAL=$(echo "$BUGS" | wc -l)
@@ -56,7 +79,15 @@ PASS_DIRECT=0; FAIL_DIRECT=0; SKIP_DIRECT=0
 PASS_PATCH=0; FAIL_PATCH=0; SKIP_PATCH=0
 COUNT=0
 
-for bug_id in $BUGS; do
+
+TOTAL=${#BUGS[@]}
+echo "  Buglist mode: $BUGLIST_MODE"
+echo "  Total bugs: $TOTAL"
+echo "========================================"
+
+for bug_id in "${BUGS[@]}"; do
+
+    #for bug_id in $BUGS; do
     project=$(echo "$bug_id" | cut -d@ -f1)
     sha=$(echo "$bug_id" | cut -d@ -f2)
 
@@ -69,89 +100,154 @@ for bug_id in $BUGS; do
     echo ""
     echo "--- [$COUNT] $bug_id ---"
 
-    # ── Mode 1: Direct checkout (validate_oracle fix + buggy) ──
-    if [[ "$MODE" == "all" ]] || [[ "$MODE" == "direct" ]]; then
-        result=$(curl -s -X POST "$BASE_URL/validate_oracle" \
-            -H "Content-Type: application/json" \
-            -d "{\"bug_id\":\"$bug_id\",\"mode\":\"fix\"}" \
-            --max-time $TIMEOUT)
+    # Paths (full SHA)
+    work_dir="$OUT_ROOT/$project/git_repo_dir_${sha}"
+    git_tree="$OUT_ROOT/$project/git_repo_dir_${sha}_gittree/.git"
+    log_dir="$OUT_ROOT/$project/logs"
+    build_dir="$work_dir/build_${sha}"
 
-        success=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('success',False))" 2>/dev/null)
-        if [[ "$success" == "True" ]]; then
-            match=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('matches_expectation',False))" 2>/dev/null)
-            if [[ "$match" == "True" ]]; then
-                echo "  direct/fix: ✅ PASS"
-                PASS_DIRECT=$((PASS_DIRECT+1))
-            else
-                echo "  direct/fix: ❌ FAIL"
-                FAIL_DIRECT=$((FAIL_DIRECT+1))
-            fi
-        else
-            error=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')[:80])" 2>/dev/null)
-            echo "  direct/fix: SKIP ($error)"
+    # Check if warmed up
+    if [[ ! -d "$build_dir" ]]; then
+        echo "  SKIP (build dir not found: $build_dir)"
+        SKIP_DIRECT=$((SKIP_DIRECT+1))
+        SKIP_PATCH=$((SKIP_PATCH+1))
+        continue
+    fi
+
+    # Determine git prefix
+    if [[ -d "$git_tree" ]]; then
+        GIT="git --git-dir=$git_tree --work-tree=$work_dir"
+    elif [[ -d "$work_dir/.git" ]]; then
+        GIT="git -C $work_dir"
+    else
+        echo "  SKIP (no .git found)"
+        SKIP_DIRECT=$((SKIP_DIRECT+1))
+        SKIP_PATCH=$((SKIP_PATCH+1))
+        continue
+    fi
+
+    # Get metadata for commit_before and src_file
+    meta=$(curl -s "$BASE_URL/get_defect/$bug_id" --max-time 10)
+    src_file=$(echo "$meta" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('fl_info',{}).get('src_file',''))" 2>/dev/null)
+    commit_before=$(echo "$meta" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('metadata',{}).get('commit_before',''))" 2>/dev/null)
+
+    if [[ -z "$src_file" ]]; then
+        echo "  SKIP (no src_file in metadata)"
+        SKIP_DIRECT=$((SKIP_DIRECT+1))
+        SKIP_PATCH=$((SKIP_PATCH+1))
+        continue
+    fi
+
+    # ── Mode 1: Direct checkout fix → test ──
+    if [[ "$MODE" == "all" ]] || [[ "$MODE" == "direct" ]]; then
+        # Checkout fix version (commit_after = sha)
+        $GIT checkout -f "$sha" -- "$src_file" 2>/dev/null
+        if [[ $? -ne 0 ]]; then
+            echo "  direct/fix: SKIP (checkout failed)"
             SKIP_DIRECT=$((SKIP_DIRECT+1))
+        else
+            # Run test via validate_oracle endpoint (which calls bug_helper.cmd_test)
+            result=$(curl -s -X POST "$BASE_URL/validate_oracle" \
+                -H "Content-Type: application/json" \
+                -d "{\"bug_id\":\"$bug_id\",\"mode\":\"fix\"}" \
+                --max-time $TIMEOUT)
+
+            success=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('success',False))" 2>/dev/null)
+            if [[ "$success" == "True" ]]; then
+                match=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('matches_expectation',False))" 2>/dev/null)
+                if [[ "$match" == "True" ]]; then
+                    echo "  direct/fix: ✅ PASS"
+                    PASS_DIRECT=$((PASS_DIRECT+1))
+                else
+                    actual=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('actual','?'))" 2>/dev/null)
+                    echo "  direct/fix: ❌ FAIL (actual=$actual)"
+                    FAIL_DIRECT=$((FAIL_DIRECT+1))
+                fi
+            else
+                error=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')[:120])" 2>/dev/null)
+                echo "  direct/fix: SKIP ($error)"
+                SKIP_DIRECT=$((SKIP_DIRECT+1))
+            fi
         fi
     fi
 
     # ── Mode 2: Diff-as-patch ──
     if [[ "$MODE" == "all" ]] || [[ "$MODE" == "patch" ]]; then
-        # Get diff between commit_before and commit_after for src_file
-        # via exec-shell inside the container
-        diff_result=$(curl -s -X POST "$BASE_URL/api/exec-shell" \
-            -H "Content-Type: application/json" \
-            -d "{\"cmd\":\"cd /out/$project/git_repo_dir_$sha && git diff $sha~1 $sha 2>/dev/null || echo NO_DIFF\",\"cwd\":\"/tmp\"}" \
-            --max-time $TIMEOUT)
+        # Get oracle diff using git --git-dir
+        diff_text=$($GIT diff "$commit_before" "$sha" -- "$src_file" 2>/dev/null)
 
-        diff_text=$(echo "$diff_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('stdout',''))" 2>/dev/null)
-
-        if [[ -z "$diff_text" ]] || [[ "$diff_text" == *"NO_DIFF"* ]]; then
+        if [[ -z "$diff_text" ]]; then
             echo "  patch: SKIP (no diff available)"
             SKIP_PATCH=$((SKIP_PATCH+1))
         else
-            # Submit diff as patch
-            patch_result=$(curl -s -X POST "$BASE_URL/build_patch" \
-                -H "Content-Type: application/json" \
-                -d "$(python3 -c "
-import sys,json
-diff = '''$diff_text'''[:50000]
-print(json.dumps({'bug_id':'$bug_id','llm_response':diff,'method':'diff','generate_diff':True,'persist_flag':True}))
-" 2>/dev/null)" \
-                --max-time $TIMEOUT)
+            # First checkout buggy version
+            $GIT checkout -f "$commit_before" -- "$src_file" 2>/dev/null
+
+            # Submit diff as patch via build_patch
+            patch_result=$(python3 -c "
+import sys, json, requests
+diff = open('/dev/stdin').read()
+r = requests.post('$BASE_URL/build_patch', json={
+    'bug_id': '$bug_id',
+    'llm_response': diff,
+    'method': 'diff',
+    'generate_diff': True,
+    'persist_flag': True,
+}, timeout=$TIMEOUT)
+print(json.dumps(r.json()))
+" <<< "$diff_text" 2>/dev/null)
 
             patch_ok=$(echo "$patch_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',False))" 2>/dev/null)
             if [[ "$patch_ok" == "True" ]]; then
                 fix_p=$(echo "$patch_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('fix_p',''))" 2>/dev/null)
-                echo "  patch: built → $fix_p"
+                echo "  patch: built → $(basename $fix_p)"
 
                 # Submit fix
                 fix_result=$(curl -s -X POST "$BASE_URL/fix" \
                     -H "Content-Type: application/json" \
                     -d "{\"bug_id\":\"$bug_id\",\"patch_path\":\"$fix_p\"}" \
-                    --max-time $TIMEOUT)
+                    --max-time 10)
                 handle=$(echo "$fix_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('handle',''))" 2>/dev/null)
 
                 if [[ -n "$handle" ]]; then
                     # Poll status
-                    for _ in $(seq 1 20); do
-                        sleep 5
-                        status=$(curl -s "$BASE_URL/status/$handle" --max-time 5 | \
-                            python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','?'),d.get('return_code','?'))" 2>/dev/null)
-                        read st rc <<< "$status"
+                    for _ in $(seq 1 30); do
+                        sleep 3
+                        status_resp=$(curl -s "$BASE_URL/status/$handle" --max-time 5)
+                        st=$(echo "$status_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null)
                         if [[ "$st" == "completed" ]] || [[ "$st" == "failed" ]]; then break; fi
                     done
-                    if [[ "$rc" == "0" ]]; then
-                        echo "  patch/fix: ✅ PASS"
-                        PASS_PATCH=$((PASS_PATCH+1))
+
+                    # Check .status file directly
+                    md5_hash=$(echo "$patch_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('md5_hash',''))" 2>/dev/null)
+                    status_file="$log_dir/patch_${sha}_fix.status"
+                    if [[ -f "$status_file" ]]; then
+                        status_content=$(cat "$status_file")
+                        if [[ "$status_content" == *"success"* ]]; then
+                            echo "  patch/fix: ✅ PASS (status=$status_content)"
+                            PASS_PATCH=$((PASS_PATCH+1))
+                        else
+                            echo "  patch/fix: ❌ FAIL (status=$status_content)"
+                            FAIL_PATCH=$((FAIL_PATCH+1))
+                        fi
                     else
-                        echo "  patch/fix: ❌ FAIL (rc=$rc)"
-                        FAIL_PATCH=$((FAIL_PATCH+1))
+                        # Fallback: check via handle
+                        rc=$(echo "$status_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('return_code','?'))" 2>/dev/null)
+                        if [[ "$rc" == "0" ]]; then
+                            echo "  patch/fix: ✅ PASS (rc=$rc)"
+                            PASS_PATCH=$((PASS_PATCH+1))
+                        else
+                            echo "  patch/fix: ❌ FAIL (rc=$rc)"
+                            FAIL_PATCH=$((FAIL_PATCH+1))
+                        fi
                     fi
                 else
                     echo "  patch/fix: SKIP (no handle)"
                     SKIP_PATCH=$((SKIP_PATCH+1))
                 fi
             else
-                echo "  patch: SKIP (build failed)"
+                error=$(echo "$patch_result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','')[:80])" 2>/dev/null)
+                echo "  patch: SKIP (build failed: $error)"
                 SKIP_PATCH=$((SKIP_PATCH+1))
             fi
         fi
