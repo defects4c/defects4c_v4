@@ -274,6 +274,18 @@ if [ -d /src/.venv ]; then
     . /src/.venv/bin/activate
 fi
 
+
+
+USERNAME="defects4c_user"
+id "$USERNAME" &>/dev/null || useradd -m -G root -s /bin/bash "$USERNAME"
+
+if command -v sudo >/dev/null 2>&1; then
+    mkdir -p /etc/sudoers.d
+    echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" > "/etc/sudoers.d/$USERNAME"
+    chmod 0440 "/etc/sudoers.d/$USERNAME"
+fi
+
+
 exec "$@"
 ENTRY
 

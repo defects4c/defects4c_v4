@@ -483,6 +483,15 @@ def d4c_reproduce(project: str, sha: str, is_force_cleanup: bool = True) -> dict
         "log_file": str(log_dir / f"{sha}.log"),
     }
 
+# add near the imports / utilities
+async def _to_thread_compat(func, *args, **kwargs):
+    try:
+        to_thread = asyncio.to_thread
+    except AttributeError:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+    else:
+        return await to_thread(func, *args, **kwargs)
 
 async def _run_reproduce_async(project: str, sha: str, handle: str):
     """Background task for reproduce."""
@@ -490,7 +499,7 @@ async def _run_reproduce_async(project: str, sha: str, handle: str):
     try:
         tasks[handle]["status"] = "running"
         log.info("[reproduce] START bug_id=%s handle=%s", bug_id, handle)
-        result = await asyncio.to_thread(bug_helper.cmd_reproduce, bug_id)
+        result = await _to_thread_compat(bug_helper.cmd_reproduce_soft , bug_id)
         log.info("[reproduce] DONE bug_id=%s handle=%s rc=%s log=%s",
                  bug_id, handle, result.get("returncode", "?"), result.get("log_file", ""))
         tasks[handle].update({
@@ -757,7 +766,7 @@ async def run_fix_async(bug_id: str, patch_path: str, handle: str):
         lock = sha_locks.setdefault(sha, asyncio.Lock())
         log.info("[fix] BUILDING bug_id=%s handle=%s — running _run_fix_sync", bug_id, handle)
         async with lock:
-            rc = await asyncio.to_thread(_run_fix_sync, instance, patch_path, lp["log"])
+            rc = await _to_thread_compat(_run_fix_sync, instance, patch_path, lp["log"])
             log.info("[fix] DONE bug_id=%s handle=%s rc=%s status=%s",
                      bug_id, handle, rc, "completed" if rc == 0 else "failed")
             tasks[handle].update({

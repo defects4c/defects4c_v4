@@ -17,7 +17,9 @@ echo "size==$size"
 
 for one_sha in $sha_list; do
     test_log="/out/$project/logs/${one_sha}.log"
-    if [[ ! -f $test_log ]]; then
+    build_dir="/out/$project/git_repo_dir_${one_sha}/build_${one_sha}"
+    #if [[ ! -f $test_log ]]; then
+    if [[ ! -f $test_log || ! -d $build_dir ]]; then
         python3 /src/bug_helper_v1_out2.py reproduce "${project}@${one_sha}"
     else
         echo "exist.....-->"$test_log

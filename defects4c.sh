@@ -3,6 +3,7 @@ set -uo pipefail
 DEFECTS4C_URL="${DEFECTS4C_URL:-http://localhost:8095}"
 CURL_TIMEOUT="${DEFECTS4C_CURL_TIMEOUT:-1900}"
 POLL_INTERVAL="${DEFECTS4C_POLL_INTERVAL:-5}"
+VERBOSE="${DEFECTS4C_VERBOSE:-0}"
 
 if [ $# -eq 0 ]; then
     cat <<'USAGE'
@@ -19,6 +20,11 @@ Commands:
   reproduce  -p <project> -v <sha>         Full reproduce (async, polls until done)
   shell      <shell_command>               Run arbitrary shell command in container
 
+Environment:
+  DEFECTS4C_URL              Server URL (default: http://localhost:8095)
+  DEFECTS4C_CURL_TIMEOUT     Curl timeout in seconds (default: 1900)
+  DEFECTS4C_VERBOSE          Set to 1 for debug output (includes curl --verbose)
+
 Examples:
   defects4c pids
   defects4c info -p danmar___cppcheck -v caa6ff7
@@ -31,12 +37,51 @@ USAGE
     exit 1
 fi
 
+dbg() { [ "$VERBOSE" = "1" ] && echo "[DEBUG] $*" >&2; }
+
+# Build extra curl flags: add --verbose when VERBOSE=1
+CURL_EXTRA=""
+[ "$VERBOSE" = "1" ] && CURL_EXTRA="--verbose"
+
+# ── Shared error handler ──
+handle_curl_error() {
+    local curl_rc="$1" target_url="$2" payload="$3" tmpfile="$4" errfile="$5"
+    echo "ERROR: request failed (curl exit code: $curl_rc)" >&2
+    echo "  URL:     $target_url" >&2
+    echo "  Payload: $payload" >&2
+    case $curl_rc in
+        6)  echo "  Reason:  Could not resolve host" >&2 ;;
+        7)  echo "  Reason:  Failed to connect to server" >&2 ;;
+        22) echo "  Reason:  HTTP error" >&2 ;;
+        23) echo "  Reason:  Write error — curl could not save response to disk" >&2
+            echo "  Disk:    $(df -h /tmp 2>/dev/null | tail -1)" >&2
+            echo "  TMPFILE: $tmpfile ($(wc -c < "$tmpfile" 2>/dev/null || echo '?') bytes written)" >&2
+            if [ -s "$tmpfile" ]; then
+                echo "  Partial response (first 500 chars):" >&2
+                head -c 500 "$tmpfile" >&2
+                echo >&2
+            fi
+            ;;
+        28) echo "  Reason:  Operation timed out (${CURL_TIMEOUT}s)" >&2 ;;
+        35) echo "  Reason:  SSL/TLS handshake failure" >&2 ;;
+        52) echo "  Reason:  Empty reply from server" >&2 ;;
+        56) echo "  Reason:  Recv failure (connection reset)" >&2 ;;
+        *)  echo "  Reason:  curl error $curl_rc (see https://curl.se/libcurl/c/libcurl-errors.html)" >&2 ;;
+    esac
+    if [ -s "$errfile" ]; then
+        echo "  Curl stderr:" >&2
+        cat "$errfile" >&2
+    fi
+}
+
 # ── Health check ──
+dbg "Health check: ${DEFECTS4C_URL}/health"
 if ! curl -s --max-time 3 "${DEFECTS4C_URL}/health" >/dev/null 2>&1; then
     echo "ERROR: cannot reach webapp at ${DEFECTS4C_URL}" >&2
     echo "  docker compose up -d" >&2
     exit 127
 fi
+dbg "Health check passed"
 
 # ── Shell subcommand: send {"cmd": "..."} to /api/exec ──
 if [ "$1" = "shell" ]; then
@@ -49,14 +94,27 @@ if [ "$1" = "shell" ]; then
     PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'cmd': sys.argv[1]}))" "$SHELL_CMD")
 
     TMPFILE=$(mktemp /tmp/d4c_resp.XXXXXX)
-    trap 'rm -f "$TMPFILE"' EXIT
+    ERRFILE=$(mktemp /tmp/d4c_err.XXXXXX)
+    trap 'rm -f "$TMPFILE" "$ERRFILE"' EXIT
 
-    HTTP_CODE=$(curl -s -o "$TMPFILE" -w "%{http_code}" \
+    TARGET_URL="${DEFECTS4C_URL}/api/exec"
+    dbg "POST $TARGET_URL"
+    dbg "Payload: $PAYLOAD"
+    dbg "Timeout: ${CURL_TIMEOUT}s"
+
+    # shellcheck disable=SC2086
+    HTTP_CODE=$(curl -s $CURL_EXTRA -o "$TMPFILE" -w "%{http_code}" \
         --max-time "$CURL_TIMEOUT" -X POST \
         -H "Content-Type: application/json" \
-        -d "$PAYLOAD" "${DEFECTS4C_URL}/api/exec") || {
-        echo "ERROR: request failed" >&2; exit 1
-    }
+        -d "$PAYLOAD" "$TARGET_URL" 2>"$ERRFILE")
+    CURL_RC=$?
+
+    if [ $CURL_RC -ne 0 ]; then
+        handle_curl_error "$CURL_RC" "$TARGET_URL" "$PAYLOAD" "$TMPFILE" "$ERRFILE"
+        exit 1
+    fi
+
+    dbg "HTTP $HTTP_CODE, response size: $(wc -c < "$TMPFILE") bytes"
 
     [ "$HTTP_CODE" -ge 500 ] && { echo "ERROR: HTTP ${HTTP_CODE}" >&2; cat "$TMPFILE" >&2; exit 1; }
 
@@ -77,16 +135,36 @@ fi
 PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'args':sys.argv[1:]}))" "$@")
 
 TMPFILE=$(mktemp /tmp/d4c_resp.XXXXXX)
-trap 'rm -f "$TMPFILE"' EXIT
+ERRFILE=$(mktemp /tmp/d4c_err.XXXXXX)
+trap 'rm -f "$TMPFILE" "$ERRFILE"' EXIT
 
-HTTP_CODE=$(curl -s -o "$TMPFILE" -w "%{http_code}" \
+TARGET_URL="${DEFECTS4C_URL}/api/exec"
+dbg "POST $TARGET_URL"
+dbg "Payload: $PAYLOAD"
+dbg "Timeout: ${CURL_TIMEOUT}s"
+
+# shellcheck disable=SC2086
+HTTP_CODE=$(curl -s $CURL_EXTRA -o "$TMPFILE" -w "%{http_code}" \
     --max-time "$CURL_TIMEOUT" -X POST \
     -H "Content-Type: application/json" \
-    -d "$PAYLOAD" "${DEFECTS4C_URL}/api/exec") || {
-    echo "ERROR: request failed" >&2; exit 1
-}
+    -d "$PAYLOAD" "$TARGET_URL" 2>"$ERRFILE")
+CURL_RC=$?
 
-[ "$HTTP_CODE" -ge 500 ] && { echo "ERROR: HTTP ${HTTP_CODE}" >&2; cat "$TMPFILE" >&2; exit 1; }
+if [ $CURL_RC -ne 0 ]; then
+    handle_curl_error "$CURL_RC" "$TARGET_URL" "$PAYLOAD" "$TMPFILE" "$ERRFILE"
+    exit 1
+fi
+
+dbg "HTTP $HTTP_CODE, response size: $(wc -c < "$TMPFILE") bytes"
+dbg "Response body: $(head -c 500 "$TMPFILE")"
+
+if [ "$HTTP_CODE" -ge 400 ]; then
+    echo "ERROR: HTTP ${HTTP_CODE}" >&2
+    echo "  URL:     $TARGET_URL" >&2
+    echo "  Payload: $PAYLOAD" >&2
+    echo "  Response: $(cat "$TMPFILE")" >&2
+    exit 1
+fi
 
 # ── Parse response ──
 export TMPFILE POLL_INTERVAL DEFECTS4C_URL

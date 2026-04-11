@@ -291,6 +291,22 @@ def read_status_file(path):
 # ═══════════════════════════════════════════════════════════════
 #  Command implementations
 # ═══════════════════════════════════════════════════════════════
+def cmd_reproduce_soft(bug_id):
+    """Full reproduce via run_reproduce.sh. Run ONCE during warmup."""
+    project, sha = parse_bug_id(bug_id)
+    instance = BugsInfo(project=project, sha=sha)
+    print(f"[cmd_reproduce] START bug_id={bug_id} cwd={instance.wrk_git}", file=sys.stderr)
+    with open(instance.wrk_log_fn, "w") as log_f:
+        instance.set_reproduce_build()
+        try:
+            timeout = 3600 if "llvm" in project else 1800
+            print(f"[cmd_reproduce] EXEC: bash run_reproduce.sh (timeout={timeout}s)", file=sys.stderr)
+            exec_cmd({"cmd": "bash run_reproduce.sh", "cwd": instance.wrk_git,
+                       "stdout": log_f, "stderr": log_f, "timeout": timeout})
+        except subprocess.TimeoutExpired:
+            print(f"[cmd_reproduce] TIMEOUT bug_id={bug_id}", file=sys.stderr)
+    print(f"[cmd_reproduce] DONE bug_id={bug_id} log={instance.wrk_log_fn}", file=sys.stderr)
+    return {"returncode": 0, "log_file": instance.wrk_log_fn}
 
 def cmd_reproduce(bug_id):
     """Full reproduce via run_reproduce.sh. Run ONCE during warmup."""

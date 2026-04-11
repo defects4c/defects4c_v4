@@ -37,3 +37,6 @@ bash inplace_test.sh  {{build_dir}}   {{test_log| replace("_fix.log", "_buggy.lo
 
 
 
+USERNAME="defects4c_user"
+chown -R "$USERNAME:$USERNAME" ./ || true
+
