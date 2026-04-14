@@ -378,6 +378,29 @@ def cmd_checkout(bug_id):
                        capture_output=True, encoding="utf-8")
     if r.returncode != 0:
         return {"returncode": r.returncode, "stdout": "", "stderr": r.stderr}
+
+    # IMPORTANT: `git checkout -f` restores the file with its stored mtime,
+    # which may be older than the last build artifact. ninja would then
+    # report "no work to do" and the stale (fix-state) binary would be tested.
+    # Touch all src files (and any other files listed in meta) so ninja sees
+    # them as modified and rebuilds the affected object files.
+    files_to_touch = []
+    meta_files = instance.meta_info.get("files") or {}
+    for key in ("src", "headers", "source"):
+        vals = meta_files.get(key) or []
+        if isinstance(vals, str):
+            vals = [vals]
+        files_to_touch.extend(vals)
+    if src_file and src_file not in files_to_touch:
+        files_to_touch.append(src_file)
+    for f in files_to_touch:
+        fp = os.path.join(instance.wrk_git, f)
+        if os.path.isfile(fp):
+            try:
+                os.utime(fp, None)
+            except OSError:
+                pass
+
     return {"returncode": 0,
             "stdout": f"Checked out buggy source: {src_file}\n  commit_before={commit_before[:12]}\n",
             "stderr": ""}
@@ -442,9 +465,9 @@ def cmd_puretest(bug_id):
 
     # ── Find the REAL test log/status/msg files ──
     # inplace_test.sh writes: test_{sha}_{md5}.log / .status / .msg
+    # where md5 is the MD5 of the src_file content.
     import glob as _glob
-    status_pattern = os.path.join(log_dir, f"test_{sha}_*.status")
-    status_files = sorted(_glob.glob(status_pattern), key=os.path.getmtime, reverse=True)
+    import hashlib as _hashlib
 
     test_log_file = ""
     test_status_file = ""
@@ -452,19 +475,37 @@ def cmd_puretest(bug_id):
     status_text = ""
     log_content = ""
 
-    if status_files:
-        test_status_file = status_files[0]  # most recent
-        base = test_status_file.rsplit(".status", 1)[0]
-        test_log_file = base + ".log"
-        test_msg_file = base + ".msg"
-        status_text = read_status_file(test_status_file)
-        print(f"[cmd_puretest] Found status_file={test_status_file} status={status_text!r}", file=sys.stderr)
-    else:
-        # Fallback: try {sha}.status
-        fallback_status = wrapper_log.replace(".log", ".status")
-        status_text = read_status_file(fallback_status)
+    # Compute MD5 of the current src_file to find the correct status file
+    src_file = instance.meta_info.get("src_file", "")
+    src_md5 = ""
+    if src_file:
+        src_path = os.path.join(instance.wrk_git, src_file)
+        if os.path.isfile(src_path):
+            h = _hashlib.md5()
+            with open(src_path, "rb") as _f:
+                for _chunk in iter(lambda: _f.read(8192), b""):
+                    h.update(_chunk)
+            src_md5 = h.hexdigest()
+            print(f"[cmd_puretest] src_file={src_file} md5={src_md5}", file=sys.stderr)
+
+    # Strategy 1: Look for status file matching the src_file MD5
+    if src_md5:
+        exact_status = os.path.join(log_dir, f"test_{sha}_{src_md5}.status")
+        if os.path.isfile(exact_status):
+            test_status_file = exact_status
+            base = test_status_file.rsplit(".status", 1)[0]
+            test_log_file = base + ".log"
+            test_msg_file = base + ".msg"
+            status_text = read_status_file(test_status_file)
+            print(f"[cmd_puretest] Found status_file (md5 match)={test_status_file} status={status_text!r}", file=sys.stderr)
+
+    # No fallback: if exact MD5 status file not found, the test didn't run
+    # (e.g., build failed). Returning a stale status file from a previous run
+    # would cause false positives.
+    if not test_status_file:
+        print(f"[cmd_puretest] No status_file for md5={src_md5}. Test likely did not run (build failure?).", file=sys.stderr)
         test_log_file = wrapper_log
-        print(f"[cmd_puretest] No test_{sha}_*.status found, fallback={fallback_status}", file=sys.stderr)
+        status_text = "FAILED"
 
     # Read the actual test log content
     actual_log = test_log_file if os.path.isfile(test_log_file) else wrapper_log

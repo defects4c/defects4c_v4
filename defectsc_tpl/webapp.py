@@ -412,16 +412,12 @@ def d4c_checkout(project: str, sha: str, is_force: bool = False) -> dict:
         return {"returncode": 1, "stdout": "",
                 "stderr": f"Repo dir {repo_dir} has no .git. Run warmup first."}
 
-    if not is_force and build_dir.exists():
-        return {"returncode": 0,
-                "stdout": f"Skip checkout: build dir already exists ({build_dir}).\n",
-                "stderr": ""}
-
-    if is_force:
-        gp = f"git --git-dir={instance._git_tree} --work-tree={instance.wrk_git}" \
-            if instance._git_tree.exists() else "git"
-        exec_shell(f"{gp} clean -dfx", cwd=str(repo_dir))
-
+    # Always run cmd_checkout to restore the buggy source file(s).
+    # `cmd_checkout` only reverts src_file via `git checkout -f commit_before -- src_file`
+    # — it does NOT touch the build directory, so warmup artifacts are preserved.
+    # Previously we skipped this step when build_dir already existed, but that
+    # left stale source (e.g., from a prior fix-state run) on disk and made
+    # subsequent tests re-use the fix-state binary.
     return bug_helper.cmd_checkout(bug_id)
 
 
