@@ -3,6 +3,14 @@
 A Defects4J-style HTTP service for C/C++ bug reproduction and automated patch validation,
 built on top of the proven `bug_helper_v1_out2.py` workflow.
 
+
+⚠️ Warning: Under Development
+
+This project is currently under active development. Please do not use it as a release/production version. Some commits may not yet be pushed — if you encounter any issues, kindly let me know.
+
+
+
+
 ## Quick Start
 
 ```bash
@@ -13,7 +21,17 @@ mkdir -p out_tmp_dirs patche_dirs workspace
 docker-compose up -d --build
 
 # 3. Warmup: full-clone cppcheck + reproduce 6 verified bugs (~15 min)
-docker exec defects4c_v2_defects4c_1 bash /src/run_warmup_selected.sh
+##docker exec defects4c_v2_defects4c_1 bash /src/run_warmup_selected.sh
+
+
+    docker exec defects4c_docker_web4-defects4c-1   bash /src/bulk_git_clone_v2.sh mini
+    docker exec defects4c_docker_web4-defects4c-1  bash /src/run_warmup.sh 32
+find /home/wj/wj_code/defects4c_dirs/defects4c_docker_web4/out/ \
+  -maxdepth 1 -mindepth 1 -type d \
+  | xargs -I {} sh -c \
+    "python /tmp/filter_bugs.py {} /tmp/list_a.txt /tmp/list_b.txt"
+
+
 
 # 4. Verify
 python3 http_tutorial.py --list         # show 6 verified bugs
