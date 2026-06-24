@@ -1,13 +1,39 @@
 build_dir=$1
 
-build_flags=" {% for option in build_flags %}{{ option }} {% endfor %} ";
+build_flags=" {% for option in build_flags %}'{{ option }}' {% endfor %} ";
 
 cur_dir=$(pwd)
+
+# Source self-heal: the v0 golden 'git_repo_dir_<sha>' was never warmed for this
+# bug, so BugsInfo fell back to the empty shared 'git_repo_dir'. Populate the
+# working tree from the sibling _gittree_<sha>/.git cache so configure.ac etc.
+# exist and the workflow's later 'git -C . checkout' commands have a real repo.
+if [ ! -f configure.ac ] && [ ! -f Makefile.am ]; then
+        _gt="{{gittree_dir}}/.git"
+        if [ -d "$_gt" ]; then
+                echo "[self-heal] populating source from $_gt"
+                git --git-dir="$_gt" --work-tree="$cur_dir" checkout -f {{commit_after}} -- .
+                # Install a local .git so subsequent in-tree git commands work.
+                if [ ! -d .git ]; then
+                        cp -a "$_gt" ./.git
+                        git checkout -f {{commit_after}} -- {{src_file}} 2>/dev/null || true
+                fi
+        fi
+fi
+
 ## build_deps
+
+# Unconditional apt deps: pkg-config + autoconf-archive provide the
+# PKG_CHECK_MODULES m4 macro and other autoconf bits that ./configure needs
+# every time it runs (slot-rebuild path included).
+{{apt_install_fn}}
+export DEBIAN_FRONTEND=noninteractive
+apt_install_fn pkg-config
+apt_install_fn autoconf-archive
 
 {% if not is_rebuild %}
 
-if [[ ! -d ../deps_dirs/automake_bin ]]; then 
+if [[ ! -d ../deps_dirs/automake_bin ]]; then
         mkdir -p ../deps_dirs/
         cd ../deps_dirs/
 
@@ -34,7 +60,7 @@ if [[ ! -d ../deps_dirs/automake_bin ]]; then
         echo "the installation is done"
         cd "$cur_dir"
 
-fi 
+fi
 {% endif %}
 
 export PATH=$cur_dir/../deps_dirs/automake_bin/bin/:$PATH
@@ -42,16 +68,33 @@ echo "the PATH is $PATH"
 automake_version=$(automake --version)
 echo "the version is $automake_version"
 
+# The locally-built automake-1.16.5 (first in PATH) does not search the
+# system aclocal dir by default, so pkg.m4 (PKG_CHECK_MODULES) and the
+# autoconf-archive DX_* doxygen macros are not found and autoreconf fails
+# with "possibly undefined macro: AC_MSG_WARN". Point aclocal at them.
+export ACLOCAL_PATH="/usr/share/aclocal${ACLOCAL_PATH:+:$ACLOCAL_PATH}"
+
 {% if not is_rebuild %}
 
-        {{apt_install_fn}}
-        apt_install_fn check 
+        apt_install_fn check
+
+        # Regenerate autotools files so PKG_CHECK_MODULES (from pkg.m4)
+        # and other m4 macros are properly expanded.
+        autoreconf -fi
 
         ./configure CFLAGS="-g -O0" LDFLAGS="-lrt" \
         --prefix="$(pwd)/$build_dir" \
-        CXX=g++ CC=gcc    
+        CXX=g++ CC=gcc
 
 {% endif %}
 
-make -j {{cpu_count}}
+# Slot-rebuild fallback: re-run autoreconf + configure if Makefile is missing.
+if [ ! -f Makefile ]; then
+        apt_install_fn check
+        autoreconf -fi
+        ./configure CFLAGS="-g -O0" LDFLAGS="-lrt" \
+                --prefix="$(pwd)/$build_dir" \
+                CXX=g++ CC=gcc
+fi
 
+make -j {{cpu_count}}

@@ -3,13 +3,23 @@
     "language": null,
     "main_repo": "https://github.com/KhronosGroup/SPIRV-Tools",
     "repo_name": "KhronosGroup___SPIRV-Tools",
-    "env": ["CXX=g++","CC=gcc"],
+    "env": [
+        "CXX=g++",
+        "CC=gcc"
+    ],
     "before_install": [],
     "c_compile": {
         "build": "build_tpl.jinja",
-        "build_flags": ["-DSPIRV_WERROR=off","-DEFFCEE_BUILD_TESTING=off"],
+        "build_flags": [
+            "-DSPIRV_WERROR=off",
+            "-DEFFCEE_BUILD_TESTING=off"
+        ],
         "test": "ctest",
-        "test_flags": [],
-        "clean": "git"
+        "test_flags": [
+            "spirv-tools-test_opt",
+            "spirv-tools-test_diff"
+        ],
+        "clean": "git",
+        "oracle_timeout": 1500
     }
 }

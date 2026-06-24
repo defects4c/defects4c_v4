@@ -14,6 +14,15 @@ and performs reproduce / patch validation inside it.  Checkout here means:
 """
 
 import asyncio
+
+# Python 3.8 compat: asyncio.to_thread was added in 3.9
+import sys as _sys
+if _sys.version_info < (3, 9):
+    import functools
+    async def _to_thread(func, *args, **kwargs):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+    asyncio.to_thread = _to_thread
 import base64
 import glob
 import hashlib
@@ -406,37 +415,35 @@ def d4c_checkout(project: str, sha: str, is_force: bool = False) -> dict:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
     repo_dir = instance.wrk_git
-    build_dir = repo_dir / f"build_{sha}"
 
-    if not ((repo_dir / ".git").exists() or instance._git_tree.exists()):
+    _gittree_git = os.path.join(str(OUT_ROOT), project, f"_gittree_{sha}", ".git")
+    if not (repo_dir / ".git").exists() and not os.path.isdir(_gittree_git):
         return {"returncode": 1, "stdout": "",
-                "stderr": f"Repo dir {repo_dir} has no .git. Run warmup first."}
+                "stderr": f"Repo dir {repo_dir} has no .git (and no sibling _gittree). Run warmup first."}
 
     # Always run cmd_checkout to restore the buggy source file(s).
     # `cmd_checkout` only reverts src_file via `git checkout -f commit_before -- src_file`
     # — it does NOT touch the build directory, so warmup artifacts are preserved.
-    # Previously we skipped this step when build_dir already existed, but that
-    # left stale source (e.g., from a prior fix-state run) on disk and made
-    # subsequent tests re-use the fix-state binary.
-    return bug_helper.cmd_checkout(bug_id)
+    result = bug_helper.cmd_checkout(bug_id)
+    return result  # includes slot_path if provided by bug_helper
 
 
-def d4c_compile(project: str, sha: str) -> dict:
+def d4c_compile(project: str, sha: str, work_dir: str = "") -> dict:
     """Check build_dir exists. Warmup already compiled."""
     try:
-        return bug_helper.cmd_compile(f"{project}@{sha}")
+        return bug_helper.cmd_compile(f"{project}@{sha}", work_dir=work_dir or None)
     except Exception as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
 
 
 
-def d4c_trigger_test(project: str, sha: str) -> dict:
+def d4c_trigger_test(project: str, sha: str, work_dir: str = "") -> dict:
     """Trigger test (synchronous): pure rebuild + test via bug_helper.cmd_puretest.
     Blocks until done, returns result with log_file, status, passed, log_content."""
     bug_id = f"{project}@{sha}"
-    log.info("[trigger_test] START bug_id=%s", bug_id)
+    log.info("[trigger_test] START bug_id=%s work_dir=%s", bug_id, work_dir)
     try:
-        result = bug_helper.cmd_puretest(bug_id)
+        result = bug_helper.cmd_puretest(bug_id, work_dir=work_dir or None)
     except Exception as exc:
         log.error("[trigger_test] EXCEPTION bug_id=%s: %s", bug_id, exc)
         return {"returncode": 1, "passed": False, "log_file": "",
@@ -689,20 +696,99 @@ def build_patch_from_llm(bug_id: str, llm_response: str, method: str = "direct",
 
 
 def _apply_diff(original: str, diff_text: str, loc: dict) -> Optional[str]:
-    old_lines, new_lines = [], []
-    for ln in diff_text.splitlines():
-        if ln.startswith("-") and not ln.startswith("---"):
-            old_lines.append(ln[1:])
-        elif ln.startswith("+") and not ln.startswith("+++"):
-            new_lines.append(ln[1:])
-    old_text = "\n".join(old_lines)
-    if old_text and old_text in original:
-        return original.replace(old_text, "\n".join(new_lines), 1)
+    """Apply a unified diff to *original*, returning the patched text or None.
+
+    Strategy order:
+      1. Parse @@ hunk headers and apply line-by-line (handles pure adds,
+         pure deletes, mixed changes, and context lines).
+      2. Fall back to simple text-match replace (old_text in original).
+      3. Fall back to loc-based region replacement as last resort.
+    """
+    import re as _re
+
+    diff_lines = diff_text.splitlines()
+
+    # -- Strategy 1: hunk-header based application ----------------------
     try:
+        hunks = []          # list of (orig_start, orig_count, hunk_lines)
+        current_hunk = None
+        for dline in diff_lines:
+            m = _re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', dline)
+            if m:
+                if current_hunk is not None:
+                    hunks.append(current_hunk)
+                orig_start = int(m.group(1))
+                orig_count = int(m.group(2)) if m.group(2) is not None else 1
+                current_hunk = (orig_start, orig_count, [])
+                continue
+            if current_hunk is not None:
+                if dline.startswith('---') or dline.startswith('+++'):
+                    continue
+                current_hunk[2].append(dline)
+        if current_hunk is not None:
+            hunks.append(current_hunk)
+
+        if hunks:
+            orig_lines = original.splitlines(keepends=True)
+            # Apply hunks in reverse order so earlier line numbers stay valid
+            hunks.sort(key=lambda h: h[0], reverse=True)
+            for orig_start, orig_count, hunk_lines in hunks:
+                new_block = []
+                consumed_old = 0
+                for hl in hunk_lines:
+                    if hl.startswith('+'):
+                        new_block.append(hl[1:] + "\n")
+                    elif hl.startswith('-'):
+                        consumed_old += 1
+                    elif hl.startswith(' '):
+                        new_block.append(hl[1:] + "\n")
+                        consumed_old += 1
+                    else:
+                        # Line with no prefix -- treat as context
+                        new_block.append(hl + "\n")
+                        consumed_old += 1
+                # orig_start is 1-based.
+                # When orig_count == 0 (pure insertion), the diff convention
+                # is that orig_start is the line AFTER which to insert.
+                if orig_count == 0 and consumed_old == 0:
+                    s = orig_start      # insert after orig_start
+                else:
+                    s = orig_start - 1  # normal: replace from orig_start
+                e = s + consumed_old
+                # Preserve the final line ending style of the last replaced line
+                if new_block and e > 0 and e <= len(orig_lines):
+                    last_orig = orig_lines[e - 1]
+                    if not last_orig.endswith("\n") and new_block[-1].endswith("\n"):
+                        new_block[-1] = new_block[-1][:-1]
+                orig_lines[s:e] = new_block
+            return ''.join(orig_lines)
+    except Exception:
+        pass
+
+    # -- Strategy 2: text-match replace ---------------------------------
+    try:
+        old_lines_s, new_lines_s = [], []
+        for ln in diff_lines:
+            if ln.startswith('-') and not ln.startswith('---'):
+                old_lines_s.append(ln[1:])
+            elif ln.startswith('+') and not ln.startswith('+++'):
+                new_lines_s.append(ln[1:])
+        old_text = "\n".join(old_lines_s)
+        if old_text and old_text in original:
+            return original.replace(old_text, "\n".join(new_lines_s), 1)
+    except Exception:
+        pass
+
+    # -- Strategy 3: loc-based fallback ---------------------------------
+    try:
+        new_lines_f = []
+        for ln in diff_lines:
+            if ln.startswith('+') and not ln.startswith('+++'):
+                new_lines_f.append(ln[1:])
         hs = loc.get("hunk_start") or loc.get("func_start", 1)
         he = loc.get("hunk_end") or loc.get("func_end", 1)
         lines = original.splitlines(keepends=True)
-        return "".join(lines[:hs - 1] + [l + "\n" for l in new_lines] + lines[he:])
+        return "".join(lines[:hs - 1] + [l + "\n" for l in new_lines_f] + lines[he:])
     except Exception:
         return None
 
@@ -834,6 +920,11 @@ class ExecRequest(BaseModel):
     args: list = []
     cmd: str = ""       # raw shell command (replaces /api/exec-shell)
     cwd: str = ""
+    work_dir: str = ""
+
+class ReleaseSlotRequest(BaseModel):
+    bug_id: str
+    slot_path: str
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -854,12 +945,111 @@ def startup():
 # ── Health ──
 @app.get("/health")
 def health():
+    """Basic health check — is the webapp alive?"""
     return {"status": "ok"}
+
+
+@app.get("/health/deep")
+def health_deep():
+    """Deep health check — verify D4C pipeline health.
+
+    Reports: metadata, zombie processes, active tasks, disk usage, workers.
+    """
+    import psutil
+    import time as _time
+
+    checks = {}
+    overall = "ok"
+
+    # 1. Metadata loaded
+    try:
+        checks["metadata"] = {"ok": bool(META_DICT), "count": len(META_DICT)}
+    except Exception as e:
+        checks["metadata"] = {"ok": False, "error": str(e)}
+        overall = "degraded"
+
+    # 2. Bug lookup
+    test_bug = None
+    try:
+        for sha in META_DICT:
+            rec = META_DICT[sha]
+            proj = rec.get("metadata", {}).get("project", "")
+            if proj:
+                test_bug = f"{proj}@{sha}"
+                break
+        checks["bug_lookup"] = {"ok": test_bug is not None, "test_bug": test_bug}
+    except Exception as e:
+        checks["bug_lookup"] = {"ok": False, "error": str(e)}
+        overall = "degraded"
+
+    # 3. Zombie/runaway processes (>45 min)
+    try:
+        long_procs = []
+        now = _time.time()
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+            try:
+                age_min = (now - proc.info["create_time"]) / 60
+                cmd = " ".join(proc.info.get("cmdline") or [])
+                if age_min > 45 and any(k in cmd for k in [
+                    "autotest", "inplace_build", "run_reproduce", "run_puretest", "run_patch"
+                ]):
+                    long_procs.append({
+                        "pid": proc.info["pid"],
+                        "age_min": round(age_min, 1),
+                        "cmd": cmd[:120],
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        checks["zombie_processes"] = {
+            "ok": len(long_procs) == 0, "count": len(long_procs),
+            "processes": long_procs[:10],
+        }
+        if long_procs:
+            overall = "degraded"
+    except Exception as e:
+        checks["zombie_processes"] = {"ok": False, "error": str(e)}
+
+    # 4. Active async tasks
+    try:
+        running = sum(1 for t in tasks.values() if t.get("status") in ("queued", "running"))
+        checks["tasks"] = {
+            "ok": True, "running": running,
+            "completed": sum(1 for t in tasks.values() if t.get("status") == "completed"),
+            "failed": sum(1 for t in tasks.values() if t.get("status") == "failed"),
+            "total": len(tasks),
+        }
+    except Exception as e:
+        checks["tasks"] = {"ok": False, "error": str(e)}
+
+    # 5. Disk usage on /out
+    try:
+        disk = psutil.disk_usage("/out")
+        checks["disk"] = {
+            "ok": disk.percent < 90,
+            "total_gb": round(disk.total / (1024**3), 1),
+            "used_gb": round(disk.used / (1024**3), 1),
+            "free_gb": round(disk.free / (1024**3), 1),
+            "percent": disk.percent,
+        }
+        if disk.percent >= 90:
+            overall = "degraded"
+    except Exception as e:
+        checks["disk"] = {"ok": False, "error": str(e)}
+
+    # 6. Gunicorn worker count
+    try:
+        workers = sum(1 for p in psutil.process_iter(["cmdline"])
+                      if "uvicorn" in " ".join(p.info.get("cmdline") or []))
+        checks["workers"] = {"ok": workers > 0, "count": workers}
+    except Exception as e:
+        checks["workers"] = {"ok": False, "error": str(e)}
+
+    return {"status": overall, "checks": checks}
 
 
 # ── D4J-compatible /api/exec ──
 @app.post("/api/exec")
-def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
+async def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
     # ── Raw shell mode (replaces /api/exec-shell) ──
     if req.cmd:
         blocked, reason = _blocked_shell(req.cmd)
@@ -867,7 +1057,7 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
             return JSONResponse(
                 {"returncode": 1, "stdout": "", "stderr": BLOCK_MSG.format(reason=reason)},
                 status_code=403)
-        return exec_shell(req.cmd, cwd=req.cwd or str(WORKSPACE), timeout=TIMEOUT)
+        return await asyncio.to_thread(exec_shell, req.cmd, cwd=req.cwd or str(WORKSPACE), timeout=TIMEOUT)
 
     # ── D4J-compatible args mode ──
     args = req.args
@@ -893,10 +1083,10 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
     try:
         if cmd == "checkout":
             log.info("[api/exec] cmd=checkout project=%s sha=%s", project, sha[:12] if sha else "?")
-            return d4c_checkout(project, sha, is_force=("-f" in flags))
+            return await asyncio.to_thread(d4c_checkout, project, sha, is_force=("-f" in flags))
         elif cmd == "compile":
             log.info("[api/exec] cmd=compile project=%s sha=%s", project, sha[:12] if sha else "?")
-            return d4c_compile(project, sha)
+            return await asyncio.to_thread(d4c_compile, project, sha, work_dir=req.work_dir)
         elif cmd == "test":
             if "-r" in flags:
                 log.info("[api/exec] cmd=test(regression) project=%s sha=%s", project, sha[:12] if sha else "?")
@@ -906,9 +1096,9 @@ def api_exec(req: ExecRequest, background_tasks: BackgroundTasks):
                 if project not in PROJECTS_DIR:
                     return {"returncode": 1, "stdout": "",
                             "stderr": f"Unknown project '{project}'"}
-                log.info("[api/exec] cmd=test project=%s sha=%s (sync)",
+                log.info("[api/exec] cmd=test project=%s sha=%s (async-thread)",
                          project, sha[:12] if sha else "?")
-                return d4c_trigger_test(project, sha)
+                return await asyncio.to_thread(d4c_trigger_test, project, sha, work_dir=req.work_dir)
         elif cmd == "info":
             if project and sha:
                 return d4c_info(project, sha)
@@ -1080,6 +1270,14 @@ def reproduce_endpoint(req: ReproduceRequest, background_tasks: BackgroundTasks)
             "stdout": f"Reproduce started: {log_file}\n", "stderr": ""}
 
 
+# ── Release slot endpoint ──
+
+@app.post("/api/release_slot")
+async def api_release_slot(req: ReleaseSlotRequest):
+    result = await asyncio.to_thread(bug_helper.cmd_release_slot, req.bug_id, req.slot_path)
+    return result
+
+
 # ── Selected bugs (cppcheck 2021-2022, verified: compile+fix=PASS+buggy=FAIL) ──
 SELECTED_SHAS = {
     "caa6ff7c2a6ef64df53e04701944aaa4712a1915",  # TestAnalyzerInformation
@@ -1227,50 +1425,78 @@ def validate_oracle(req: OracleRequest):
     build_dir = repo_dir / f"build_{sha}"
     src_file = instance.meta_info.get("src_file", "")
 
-    if not ((repo_dir / ".git").exists() or instance._git_tree.exists()):
-        return {"success": False, "error": f"Repo not found: {repo_dir}. Run warmup first."}
-    if not build_dir.exists():
-        return {"success": False, "error": f"Build dir not found: {build_dir}. Run warmup first."}
+    _gittree_git = os.path.join(str(OUT_ROOT), project, f"_gittree_{sha}", ".git")
+    if not (repo_dir / ".git").exists() and not os.path.isdir(_gittree_git):
+        return {"success": False, "error": f"Repo not found: {repo_dir} and no sibling _gittree. Run warmup first."}
+    # build_dir may not exist for in-place build projects (php, libgd, sqlite, etc.)
+    # Skip check — cmd_puretest handles both cmake and in-place builds.
 
     commit_after = sha
     commit_before = instance.meta_defect.get("commit_before", "")
     expected_test = "PASS" if req.mode == "fix" else "FAIL"
     target_commit = commit_after if req.mode == "fix" else commit_before
 
-    # Use bug_helper git_prefix for checkout
-    bh_instance = bug_helper.BugsInfo(project, sha)
-    gp = bh_instance.git_prefix()
+    # Acquire a pool slot for oracle validation
+    try:
+        slot_path, lock_fd = bug_helper.acquire_slot(project, sha)
+    except Exception as exc:
+        return {"success": False, "error": f"Failed to acquire pool slot: {exc}"}
 
-    # Fallback for commit_before
-    if req.mode == "buggy":
-        r = subprocess.run(f"{gp} cat-file -t {target_commit}", shell=True,
-                           cwd=str(repo_dir), capture_output=True, encoding="utf-8")
-        if r.returncode != 0:
-            r2 = subprocess.run(f"{gp} rev-parse {commit_after}~1", shell=True,
-                                cwd=str(repo_dir), capture_output=True, encoding="utf-8")
-            if r2.returncode == 0 and r2.stdout.strip():
-                target_commit = r2.stdout.strip()
-            else:
-                return {"success": False, "error": "commit_before unreachable"}
-
-    # Step 1: Checkout target source via git
-    if src_file:
-        cmd = f"{gp} checkout -f {target_commit} -- {src_file}"
+    golden_dir = str(repo_dir)  # repo_dir is the golden (fallback work-tree / cwd)
+    gittree_dir = os.path.join(str(OUT_ROOT), project, f"_gittree_{sha}")
+    gittree_git = os.path.join(gittree_dir, ".git")
+    # Backward-compat: if _gittree not yet present (pre-migration), fall back to golden's .git.
+    if os.path.isdir(gittree_git):
+        gp = f"git --git-dir={gittree_git}"
     else:
-        cmd = f"{gp} checkout -f {target_commit}"
-    log.info("[validate_oracle] CHECKOUT mode=%s bug_id=%s@%s cmd=%s", req.mode, project, sha[:12], cmd)
-    r = subprocess.run(cmd, shell=True, cwd=str(repo_dir),
-                       capture_output=True, encoding="utf-8")
-    if r.returncode != 0:
-        log.warning("[validate_oracle] CHECKOUT FAILED mode=%s bug_id=%s@%s stderr=%s",
-                    req.mode, project, sha[:12], r.stderr[:200])
-        return {"success": False, "step": "checkout", "error": r.stderr[:500]}
+        gp = f"git -C {golden_dir}"
 
-    # Step 2+3: Rebuild + test via bug_helper.cmd_puretest
-    bug_id = f"{project}@{sha}"
-    log.info("[validate_oracle] mode=%s bug_id=%s target_commit=%s src_file=%s — running cmd_puretest",
-             req.mode, bug_id, target_commit[:12], src_file)
-    test_result = bug_helper.cmd_puretest(bug_id)
+    try:
+        # Fallback for commit_before
+        if req.mode == "buggy":
+            r = subprocess.run(f"{gp} cat-file -t {target_commit}", shell=True,
+                               cwd=golden_dir, capture_output=True, encoding="utf-8")
+            if r.returncode != 0:
+                r2 = subprocess.run(f"{gp} rev-parse {commit_after}~1", shell=True,
+                                    cwd=golden_dir, capture_output=True, encoding="utf-8")
+                if r2.returncode == 0 and r2.stdout.strip():
+                    target_commit = r2.stdout.strip()
+                else:
+                    return {"success": False, "error": "commit_before unreachable"}
+
+        # Step 1: Extract target source from golden .git into slot
+        if src_file:
+            r = subprocess.run(
+                f"{gp} show {target_commit}:{src_file}",
+                shell=True, cwd=golden_dir, capture_output=True)
+            if r.returncode != 0:
+                return {"success": False, "step": "checkout",
+                        "error": f"git show failed: {r.stderr.decode('utf-8', errors='replace')[:500]}"}
+            import os as _os
+            dst = _os.path.join(slot_path, src_file)
+            _os.makedirs(_os.path.dirname(dst), exist_ok=True)
+            with open(dst, 'wb') as _f:
+                _f.write(r.stdout)
+            # Touch to invalidate build cache
+            _os.utime(dst, None)
+        else:
+            cmd = f"{gp} checkout -f {target_commit}"
+            log.info("[validate_oracle] CHECKOUT mode=%s bug_id=%s@%s cmd=%s", req.mode, project, sha[:12], cmd)
+            r = subprocess.run(cmd, shell=True, cwd=slot_path,
+                               capture_output=True, encoding="utf-8")
+            if r.returncode != 0:
+                return {"success": False, "step": "checkout", "error": r.stderr[:500]}
+
+        log.info("[validate_oracle] CHECKOUT mode=%s bug_id=%s@%s target=%s slot=%s",
+                 req.mode, project, sha[:12], target_commit[:12], slot_path)
+
+        # Step 2+3: Rebuild + test via bug_helper.cmd_puretest on the slot
+        bug_id = f"{project}@{sha}"
+        log.info("[validate_oracle] mode=%s bug_id=%s target_commit=%s src_file=%s — running cmd_puretest in slot",
+                 req.mode, bug_id, target_commit[:12], src_file)
+        test_result = bug_helper.cmd_puretest(bug_id, work_dir=slot_path)
+    finally:
+        bug_helper.release_slot(lock_fd)
     log.info("[validate_oracle] mode=%s bug_id=%s — cmd_puretest returned rc=%s",
              req.mode, bug_id, test_result.get("returncode", "?"))
 
@@ -1300,4 +1526,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("D4C_PORT", "11111"))
     uvicorn.run(app, host="0.0.0.0", port=port)
-

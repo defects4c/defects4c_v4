@@ -3,30 +3,39 @@ test_log=$2
 
 
 fn=$(realpath $build_dir)
+
+# Unconditional apt dep: libudns-dev is needed on every (re)build because
+# the slot copy does not inherit installed system packages reliably.
+{{apt_install_fn}}
+export DEBIAN_FRONTEND=noninteractive
+apt_install_fn libudns-dev
+
 {% if not is_rebuild %}
 
-	{{apt_install_fn}}
-	export DEBIAN_FRONTEND=noninteractive 
-	apt_install_fn apache2-utils 
-	apt_install_fn cdbs 
-	apt_install_fn dh-autoreconf 
-	apt_install_fn devscripts 
-	apt_install_fn libev-dev 
-	apt_install_fn libpcre3-dev 
-	apt_install_fn libudns-dev 
-	apt_install_fn lintian   
+	apt_install_fn apache2-utils
+	apt_install_fn cdbs
+	apt_install_fn dh-autoreconf
+	apt_install_fn devscripts
+	apt_install_fn libev-dev
+	apt_install_fn libpcre3-dev
+	apt_install_fn lintian
 	apt_install_fn valgrind
-  
-  
-	if [ -f "autogen.sh" ] ; then 
-	
-		./autogen.sh 
-	fi 
-	
-	./configure   --prefix=$fn 
+
+
+	if [ -f "autogen.sh" ] ; then
+
+		./autogen.sh
+	fi
+
+	./configure   --prefix=$fn
 
 {% endif %}
 
+# Slot-rebuild fallback: if Makefile is missing, re-run autogen/autoreconf + configure.
+if [ ! -f Makefile ]; then
+	if [ -f autogen.sh ]; then bash ./autogen.sh; else autoreconf -i; fi
+	./configure --prefix=$fn
+fi
 
-make -j {{ cpu_count }}   
 
+make -j {{ cpu_count }}

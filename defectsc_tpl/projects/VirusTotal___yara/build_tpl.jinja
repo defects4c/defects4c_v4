@@ -3,28 +3,72 @@ test_log=$2
 
 fn=$(realpath $build_dir )
 
+cur_dir=$(pwd)
+
+# When CFLAGS carries -fsanitize=address, configure's "can it run a compiled
+# program" test links a tiny ASAN binary whose runtime sanity checks abort
+# with SIGSEGV (exit 139) under this container, making configure fail with
+# "cannot run C compiled programs". Relax ASAN's startup checks so the probe
+# (and the test binaries) run; the actual heap-overflow detection still works.
+export ASAN_OPTIONS="verify_asan_link_order=0:detect_leaks=0:${ASAN_OPTIONS}"
+# Source self-heal: the v0 golden 'git_repo_dir_<sha>' was never warmed for this
+# bug, so BugsInfo fell back to the empty shared 'git_repo_dir'. Populate the
+# working tree from the sibling _gittree_<sha>/.git cache so configure.ac /
+# bootstrap.sh exist and the workflow's later in-tree git checkout works.
+if [ ! -f configure.ac ] && [ ! -f bootstrap.sh ]; then
+        _gt="{{gittree_dir}}/.git"
+        if [ -d "$_gt" ]; then
+                echo "[self-heal] populating source from $_gt"
+                git --git-dir="$_gt" --work-tree="$cur_dir" checkout -f {{commit_after}} -- .
+                if [ ! -d .git ]; then
+                        cp -a "$_gt" ./.git
+                        git checkout -f {{commit_after}} -- {{src_file}} 2>/dev/null || true
+                fi
+        fi
+fi
+
+# Clean stale build artifacts from prior runs to avoid test failures
+make clean 2>/dev/null || true
+
 {% if not is_rebuild %}
-	if [ -f "./bootstrap.sh" ]; then 
-		./bootstrap.sh 
-	fi 
-	
+	if [ -f "./bootstrap.sh" ]; then
+		./bootstrap.sh
+	fi
+
+	# Surgically drop the module-registry objects on the warmup build. A
+	# plain 'make clean' can leave a stale libyara/modules.o compiled WITHOUT
+	# -DHASH_MODULE (from an earlier OpenSSL-less probe), which leaves the
+	# hash module unregistered and makes tests/test-rules fail with "invalid
+	# field name md5". Removing just these forces a recompile with the fresh
+	# config's -DHASH_MODULE without re-running the whole configure probe
+	# (which can SIGSEGV under ASAN on this host).
+	rm -f libyara/modules.o libyara/modules.lo libyara/.libs/modules.o 2>/dev/null || true
+	rm -f libyara/modules/hash.o libyara/modules/hash.lo libyara/modules/.libs/hash.o 2>/dev/null || true
+
 #	  --enable-static=no \
 	./configure  \
 	--prefix=$fn  \
 	 --enable-debug \
 	  --enable-shared=yes \
-	  CFLAGS="-fsanitize=address -g"  
-	
-	
+	  CFLAGS="-fsanitize=address -g"
+
+
 {% endif %}
 
-
-
-if [ "$TRAVIS_OS_NAME" == "osx" ] || [ "$CC" == "clang" ]; then
-  make CFLAGS="-fsanitize=address -g" -j {{cpu_count}}
-else
-  make -j {{cpu_count}}
+# Slot-rebuild fallback: if the configure artifacts are missing, re-run bootstrap + configure.
+if [ ! -f Makefile ]; then
+	if [ -f "./bootstrap.sh" ]; then bash ./bootstrap.sh; fi
+	./configure  \
+	--prefix=$fn  \
+	 --enable-debug \
+	  --enable-shared=yes \
+	  CFLAGS="-fsanitize=address -g"
 fi
 
 
-
+# NOTE: do NOT override CFLAGS on the make line. configure already stored
+# CFLAGS="-fsanitize=address -g" *plus* the auto-added -DHASH_MODULE (and the
+# OpenSSL HAVE_* defines) into the generated Makefiles. Passing CFLAGS= here
+# would clobber -DHASH_MODULE, leaving libyara/modules.o without the hash
+# module registered and breaking tests/test-rules ("invalid field name md5").
+make -j {{cpu_count}}

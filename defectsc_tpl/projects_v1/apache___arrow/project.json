@@ -7,10 +7,11 @@
     "before_install": [],
     "c_compile": {
         "build": "ninja",
-        "build_flags": ["-S=cpp", 
+        "build_flags": ["-S=cpp",
 "-DARROW_BUILD_STATIC=OFF",
 "-DARROW_COMPUTE=ON",
 "-DARROW_BUILD_STATIC=OFF",
+"-DARROW_JEMALLOC=OFF",
 "-DARROW_BUILD_SHARED=ON",
 "-DARROW_BUILD_TESTS=ON",
 "-DARROW_INSTALL_NAME_RPATH=OFF",

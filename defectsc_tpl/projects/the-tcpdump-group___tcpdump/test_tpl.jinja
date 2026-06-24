@@ -49,16 +49,60 @@ if [[ -f tests/TESTLIST && -f tests/TESTonce ]]; then
     timeout 30 ./TESTrun.sh >> "$fix_log_msg" 2>&1
   }
 
+  ###########################################################################
+  # ASAN variant: run ONLY the matching TESTLIST entries via TESTonce, using
+  # the EXACT options recorded in TESTLIST (NO extra -vvv). The golden .out was
+  # captured with the recorded options; adding -vvv produces extra hex dumps
+  # that diff against the golden and would make the FIXED binary fail too.
+  ###########################################################################
+  run_test_asan() {
+    local pattern=$1
+    # Force ASAN to ABORT on the first error with a non-zero exit code. Without
+    # this, an OOB read that surfaces as SIGSEGV can send ASAN's signal handler
+    # into an infinite DEADLYSIGNAL re-entry loop, so TESTonce HANGS and is killed
+    # by the timeout, producing NO "TEST FAILED" line (a flaky false PASS).
+    export ASAN_OPTIONS="abort_on_error=1:exitcode=1:handle_segv=1:handle_sigbus=1:handle_abort=1:disable_coredump=1:detect_leaks=0"
+    # Read TESTLIST entries into an array first (avoid a pipe subshell whose exit
+    # status is swallowed under pipefail).
+    local lines
+    lines=$(grep -F -- "$pattern" TESTLIST)
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local name input output options
+      read -r name input output options <<< "$line"
+      timeout -s KILL 60 ./TESTonce "$name" "$input" "$output" "$options" \
+        >> "$fix_log_msg" 2>&1
+      local rc=$?
+      # A timeout (124/137) or any non-zero TESTonce exit means the binary did not
+      # cleanly pass (it aborted/hung under ASAN). Record an explicit failure line
+      # so the PASS/FAIL grep below is reliable even if TESTonce was killed before
+      # printing its own "TEST FAILED" message.
+      if [[ $rc -ne 0 ]]; then
+        printf '    %-35s: TEST FAILED(asan exit %s)\n' "$name" "$rc" >> "$fix_log_msg"
+      fi
+    done <<< "$lines"
+  }
 
 
+
+{% set is_asan = build_flags and ("asan" in build_flags) %}
 {% for one_file in test_files %}
 {%   if one_file.endswith(".pcap") %}
   test_case_name="$(basename "{{ one_file }}")"
+{%   if is_asan %}
+  # ASAN CVE bug: run ONLY the bug-specific test via TESTonce. Running the whole
+  # TESTrun.sh suite under ASAN times out (the OOB-read PoC + the unrelated
+  # complex .sh tests are slow/hang under the sanitizer), which would truncate
+  # the log before the failing test runs and mask the FAIL. TESTonce is fast and
+  # reports "TEST FAILED" directly when the buggy binary aborts.
+  run_test_asan "$test_case_name"
+{%   else %}
   if [[ -f TESTrun.sh ]]; then
     run_test_testfilter "$test_case_name"
   else
     run_test "$test_case_name"
   fi
+{%   endif %}
 
 {%   endif %}
 {% endfor %}

@@ -7,39 +7,25 @@ error() {
     echo "[ERROR] $*" >&2
 }
 
-# Validate that a git-dir is actually a working git repository
-# Usage: validate_git_dir <git-dir-path> <work-tree-path>
 validate_git_dir() {
     local gitdir="$1"
     local worktree="$2"
-
-    if [[ ! -d "$gitdir" ]]; then
-        return 1
-    fi
-
-    # Must have essential git internals: HEAD, objects, refs
+    if [[ ! -d "$gitdir" ]]; then return 1; fi
     if [[ ! -f "$gitdir/HEAD" || ! -d "$gitdir/objects" || ! -d "$gitdir/refs" ]]; then
-        echo "WARNING: $gitdir is missing essential git internals (HEAD/objects/refs)"
+        echo "WARNING: $gitdir is missing essential git internals"
         return 1
     fi
-
-    # Actually test with git rev-parse
     if ! git --git-dir="$gitdir" --work-tree="$worktree" rev-parse --git-dir >/dev/null 2>&1; then
         echo "WARNING: git rev-parse failed on $gitdir"
         return 1
     fi
-
     return 0
 }
 
 trap 'error "git_setup.sh failed for project=${project_name:-unknown} at line $LINENO: $BASH_COMMAND"' ERR
 
-# Simplified git repository setup with selective commit fetching
-# Usage: ./git_setup.sh <project_name> <commit1> <commit2> [commit3] ...
-
 if [ $# -lt 3 ]; then
     echo "Usage: $0 <project_name> <commit1> <commit2> [commit3] ..."
-    echo "Example: $0 php___php-src 1bd103df00f49cf4d4ade2cfe3f456ac058a4eae a3598dd7c9b182debcb54b9322b1dece14c9b533"
     exit 1
 fi
 
@@ -50,79 +36,79 @@ commits=("$@")
 for sha in "${commits[@]}"; do
     if [[ -z "$sha" || "$sha" == "null" ]]; then
         echo "ERROR: Invalid commit sha: '$sha'"
-        echo "Project: $project_name"
         exit 1
     fi
 done
 
-# Convert project name to GitHub URL format
 raw_repo="${project_name/___/\/}"
 github_url="https://github.com/${raw_repo}"
 
-# Resolve output dir relative to where git_setup.sh is located
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 base_out_dir="${script_dir}"
 
-# Use first commit as the main directory identifier
 main_commit="${commits[0]}"
 target_dir="${base_out_dir}/${project_name}/git_repo_dir_${main_commit}"
-target_dir_git="${base_out_dir}/${project_name}/git_repo_dir_${main_commit}_gittree"
+gittree_dir="${base_out_dir}/${project_name}/_gittree_${main_commit}"
 
 echo "Setting up repository for project: $project_name"
 echo "GitHub URL: $github_url"
-echo "Base output directory: $base_out_dir"
-echo "Target directory (work-tree): $target_dir"
-echo "Target directory (git-dir):   $target_dir_git"
+echo "Target directory: $target_dir"
+echo "Gittree directory: $gittree_dir"
 echo "Commits to fetch: ${commits[*]}"
 
-# ─── Three-case logic ───────────────────────────────────────────────
+# ─── Idempotency: if BOTH locations have .git, error out ───────────
+if [[ -d "$target_dir/.git" && -d "$gittree_dir/.git" ]]; then
+    echo "ERROR: BOTH $target_dir/.git AND $gittree_dir/.git exist. Refusing to proceed."
+    exit 1
+fi
 
-# Case 3: Both exist, .git is already in target_dir_git → validate and skip
-if [[ -d "$target_dir" && -d "$target_dir_git" && ! -d "$target_dir/.git" && -d "$target_dir_git/.git" ]]; then
-    if validate_git_dir "$target_dir_git/.git" "$target_dir"; then
-        echo "✓ Already set up and validated: work-tree at $target_dir, git-dir at $target_dir_git. Skipping."
+# ─── Idempotency: already migrated → exit 0 ────────────────────────
+if [[ -d "$gittree_dir/.git" && -d "$target_dir" && ! -d "$target_dir/.git" ]]; then
+    if validate_git_dir "$gittree_dir/.git" "$target_dir"; then
+        echo "✓ Already migrated and validated: history at $gittree_dir/.git, work-tree at $target_dir. Skipping."
         exit 0
     else
-        echo "WARNING: $target_dir_git/.git exists but is broken. Nuking both and redoing full pipeline."
-        rm -rf "$target_dir" "$target_dir_git"
+        echo "WARNING: $gittree_dir/.git exists but is broken. Nuking and redoing."
+        rm -rf "$target_dir" "$gittree_dir"
     fi
 fi
 
-# Case 2: target_dir exists but target_dir_git does not → .git is still inside target_dir, move it
-if [[ -d "$target_dir" && ! -d "$target_dir_git" && -d "$target_dir/.git" ]]; then
-    echo "Work-tree exists with .git inside. Moving .git to $target_dir_git ..."
-    mkdir -p "$target_dir_git"
-    mv "$target_dir/.git" "$target_dir_git/.git"
-    if validate_git_dir "$target_dir_git/.git" "$target_dir"; then
-        echo "✓ Moved and validated .git at $target_dir_git/.git"
+# ─── Case: target_dir has .git but sibling does NOT — do the move at end of pipeline ──
+# (handled by relocate trailer below; here we just allow the validate-and-skip path
+#  for the in-place state to fall through to the full pipeline if it's broken.)
+if [[ -d "$target_dir/.git" && ! -d "$gittree_dir/.git" ]]; then
+    if validate_git_dir "$target_dir/.git" "$target_dir"; then
+        echo "Pre-existing $target_dir/.git is valid; will relocate to $gittree_dir/.git at end."
+        # Skip the full clone pipeline; jump straight to relocation.
+        mkdir -p "$gittree_dir"
+        mv "$target_dir/.git" "$gittree_dir/.git"
+        if ! validate_git_dir "$gittree_dir/.git" "$target_dir"; then
+            echo "ERROR: post-move validation failed."
+            exit 1
+        fi
+        echo "✓ Done. Repository at: $target_dir (history relocated to _gittree_${main_commit}/.git)"
         exit 0
     else
-        echo "WARNING: Moved .git but it is broken. Nuking both and redoing full pipeline."
-        rm -rf "$target_dir" "$target_dir_git"
+        echo "WARNING: $target_dir/.git exists but is broken. Nuking and redoing."
+        rm -rf "$target_dir" "$gittree_dir"
     fi
 fi
 
-# Case 1: target_dir does not exist → full pipeline
-# Even if target_dir_git exists, delete it (stale/incomplete state)
-if [[ -d "$target_dir_git" ]]; then
-    echo "target_dir does not exist but target_dir_git does. Removing stale git-dir: $target_dir_git"
-    rm -rf "$target_dir_git"
-fi
-
-# Also clean up target_dir if it somehow exists but is broken (no .git, no separate git-dir)
-if [[ -d "$target_dir" && ! -d "$target_dir/.git" ]]; then
-    echo "target_dir exists but has no .git and no separate git-dir. Removing broken work-tree: $target_dir"
+# ─── Case 2: target_dir exists but no .git (and no _gittree) ──────
+if [[ -d "$target_dir" && ! -d "$target_dir/.git" && ! -d "$gittree_dir/.git" ]]; then
+    echo "target_dir exists but has no .git (and no gittree). Removing broken work-tree: $target_dir"
     rm -rf "$target_dir"
 fi
 
-# ─── Full pipeline: init, fetch, checkout, then separate .git ───────
+# Clean up any stale empty _gittree (no .git inside)
+if [[ -d "$gittree_dir" && ! -d "$gittree_dir/.git" ]]; then
+    rm -rf "$gittree_dir"
+fi
 
+# ─── Full pipeline: init, fetch, checkout ──────────────────────────
 echo "Creating directory: $target_dir"
 mkdir -p "$target_dir"
-cd "$target_dir" || {
-    echo "ERROR: Cannot change to directory: $target_dir"
-    exit 1
-}
+cd "$target_dir" || { echo "ERROR: Cannot cd to $target_dir"; exit 1; }
 
 echo "Initializing git repository..."
 if [[ ! -d .git ]]; then
@@ -148,12 +134,9 @@ for sha in "${commits[@]}"; do
     echo "✓ Successfully fetched: $sha"
 done
 
-echo ""
 echo "Testing checkout to first commit..."
 if timeout 1200 git checkout "${commits[0]}"; then
     echo "✓ Successfully checked out: ${commits[0]}"
-    echo ""
-    echo "Current branch/commit:"
     git log --oneline -1
 else
     echo "ERROR: Failed to checkout ${commits[0]}"
@@ -163,34 +146,27 @@ fi
 echo "Updating submodules..."
 if ! timeout 1200 git submodule update --init --recursive --jobs 1; then
     echo "ERROR: Submodule update failed"
-    echo "Project: $project_name"
-    echo "Target directory: $target_dir"
     exit 1
 fi
 echo "Submodule update finished successfully"
 
-# ─── Move .git into the separate git-dir ─────────────────────────────
-
-echo "Separating .git into: $target_dir_git"
-mkdir -p "$target_dir_git"
-mv "$target_dir/.git" "$target_dir_git/.git"
-
-# ─── Final assertion ─────────────────────────────────────────────────
-
-if [[ -d "$target_dir/.git" ]]; then
-    echo "ERROR: $target_dir/.git still exists after move. This should not happen."
+# ─── Relocate .git OUT of target_dir into sibling _gittree_<sha>/ ──
+if [[ ! -d "$target_dir/.git" ]]; then
+    echo "ERROR: $target_dir/.git does not exist after pipeline."
     exit 1
 fi
 
-if [[ ! -d "$target_dir_git/.git" ]]; then
-    echo "ERROR: $target_dir_git/.git does not exist after move. This should not happen."
+if [[ -d "$gittree_dir/.git" ]]; then
+    echo "ERROR: $gittree_dir/.git unexpectedly exists pre-relocation."
     exit 1
 fi
 
-if ! validate_git_dir "$target_dir_git/.git" "$target_dir"; then
-    echo "ERROR: $target_dir_git/.git exists but is not a valid git repository after full pipeline."
+mkdir -p "$gittree_dir"
+mv "$target_dir/.git" "$gittree_dir/.git"
+
+if ! validate_git_dir "$gittree_dir/.git" "$target_dir"; then
+    echo "ERROR: .git is not valid after relocation."
     exit 1
 fi
 
-echo "✓ Done. Work-tree: $target_dir | Git-dir: $target_dir_git"
-
+echo "✓ Done. Repository at: $target_dir (history relocated to _gittree_${main_commit}/.git)"

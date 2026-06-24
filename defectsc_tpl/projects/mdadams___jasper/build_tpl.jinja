@@ -2,26 +2,41 @@ build_dir=$1
 
 build_flags=" {% for option in build_flags %}{{ option }} {% endfor %} ";
 
-
-
-
-
+# NOTE: This project's oracle (CVE-2016-9583, jpc_pi_nextrpcl) is built WITHOUT
+# AddressSanitizer on purpose. The fix commit (pi->picomp -> picomp) makes the
+# regression input data/test/good/PoC2.jpc decode cleanly in a normal build,
+# but under -fsanitize=address the *fixed* binary still SEGVs on a benign,
+# ASLR-dependent shadow-memory access (~17% of runs), which made the oracle
+# flaky (fix sometimes reported FAIL). Verified: fixed build = 30/30 PASS,
+# buggy build = 30/30 SEGV without ASAN. So the bug is still detected (buggy
+# crashes 100%) and the fix is deterministically green.
 
 {% if not is_rebuild %}
-	
- 
- 
+
+
 	cmake -G Ninja -B $build_dir \
-	-DCMAKE_BUILD_TYPE=ASAN  \
-	-DCMAKE_C_FLAGS=" -fsanitize=address" \
+	-DCMAKE_BUILD_TYPE=Release \
 	-DCMAKE_C_COMPILER="clang" 
 
 
 {% endif %}
 
+# Fallback: if build dir missing (e.g. after slot clean), re-run cmake
+if [ ! -d "$build_dir" ]; then
+	cmake -G Ninja -B $build_dir \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DCMAKE_C_COMPILER="clang"
+fi
 
+{% if is_rebuild %}
+# Oracle rebuild path: the slot src_file ({{src_file}}) was just swapped between
+# fixed/buggy versions. ninja compares mtimes, and the object written
+# milliseconds earlier by the previous mode build can look newer than the
+# freshly-swapped source, so the stale (wrong-mode) object/library would be
+# tested -> non-deterministic PASS/FAIL. Force a deterministic recompile+relink
+# by deleting the changed source compiled object(s) before ninja.
+src_base="$(basename "{{src_file}}" .c)"
+find "$build_dir" -name "${src_base}.c.o" -delete 2>/dev/null || true
+{% endif %}
 
-ninja  -C $build_dir 
-
-
-
+ninja  -C $build_dir

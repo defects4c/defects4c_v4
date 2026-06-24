@@ -6,37 +6,103 @@ fn=$(realpath $test_log )
 fix_log="${test_log/\.log/}"
 
 
-cat /dev/null > $test_log  
+cat /dev/null > $test_log
+
+# ----------------------------------------------------------------------
+# Memory-bug detection (ORACLE CORRECTNESS).
+#
+# Some bugs are memory-safety defects (use-after-free, OOB write, stack
+# under/overflow) whose buggy version does NOT change the test's printed
+# output -- run-tests.php still reports "Tests passed (100.0%)" because the
+# corruption is silent. To make the oracle DETECT these defects we run the
+# affected .phpt under a memory checker, choosing the checker that fits the
+# binary:
+#
+#   * If the php binary was compiled with AddressSanitizer (it exports
+#     __asan_* symbols), ASAN already instruments every access. We just let
+#     it run with ASAN_OPTIONS that HALT on the first error (so a crashing
+#     test cannot spin forever emitting "DEADLYSIGNAL" and filling the disk),
+#     and bound the wall-clock time and captured output.
+#
+#   * Otherwise, if valgrind is available, use PHP's native memcheck mode
+#     (run-tests.php -m) with USE_ZEND_ALLOC=0 so the system allocator (and
+#     valgrind) sees every alloc/free. run-tests marks the test LEAKED on any
+#     valgrind error, which drops it out of "Tests passed (100.0%)".
+#
+# A hard crash (SIGSEGV/SIGABRT) is detected regardless: the child dies, the
+# test is reported FAILED, and get_status() below also scans for crash /
+# sanitizer / valgrind signatures.
+#
+# This path is keyed on src_file so it ONLY affects the known memory bugs;
+# every other php bug runs the original plain path unchanged (no regression).
+src_file="{{ src_file }}"
+mem_check=0
+case "$src_file" in
+	ext/standard/http_fopen_wrapper.c|ext/wddx/wddx.c|ext/phar/phar.c)
+		mem_check=1 ;;
+esac
+
+php_is_asan=0
+if nm sapi/cli/php 2>/dev/null | grep -q "__asan_"; then
+	php_is_asan=1
+fi
+has_valgrind=0
+if command -v valgrind >/dev/null 2>&1; then
+	has_valgrind=1
+fi
+
+# Cap captured output to 20 MB and wall-clock to 300 s: a memory-corruption
+# test can loop emitting sanitizer errors, and an unbounded log has filled the
+# disk with multi-GB files before.
+MEM_TIMEOUT=300
+MEM_CAP_BYTES=20000000
+export ASAN_OPTIONS="halt_on_error=1:abort_on_error=1:exitcode=134:detect_leaks=0:log_path=stderr"
 
 {% for test_file in test_files %}
 	{% if test_file.endswith(".phpt") %}
-	
-		sapi/cli/php run-tests.php -p sapi/cli/php -g "FAIL,XFAIL,BORK,WARN,LEAK,SKIP" {{test_file}} >> $test_log  2>&1 
-	
+
+		if [ "$mem_check" = "1" ] && [ "$php_is_asan" = "1" ]; then
+			# ASAN-instrumented binary: run plainly but bounded; ASAN reports
+			# the defect itself.
+			USE_ZEND_ALLOC=0 timeout ${MEM_TIMEOUT} \
+				sapi/cli/php run-tests.php -p sapi/cli/php -g "FAIL,XFAIL,BORK,WARN,LEAK,SKIP" {{test_file}} 2>&1 \
+				| head -c ${MEM_CAP_BYTES} >> $test_log
+		elif [ "$mem_check" = "1" ] && [ "$has_valgrind" = "1" ]; then
+			# Non-ASAN binary: use valgrind memcheck via run-tests -m.
+			USE_ZEND_ALLOC=0 timeout ${MEM_TIMEOUT} \
+				sapi/cli/php run-tests.php -m -p sapi/cli/php -g "FAIL,XFAIL,BORK,WARN,LEAK,SKIP" {{test_file}} 2>&1 \
+				| head -c ${MEM_CAP_BYTES} >> $test_log
+		else
+			sapi/cli/php run-tests.php -p sapi/cli/php -g "FAIL,XFAIL,BORK,WARN,LEAK,SKIP" {{test_file}} >> $test_log  2>&1
+		fi
+
 	{% endif %}
 
-{% endfor %}  
+{% endfor %}
 
 
 get_status() {
+	# Strict pass requirement (unchanged): every test must pass 100%.
 	string=$(cat $fn|grep "Tests passed"|grep "(100.0%)" )
-	
-	if [[ -z $string ]]; then 
+
+	# Memory-defect signals: a leak/sanitizer/valgrind error or a crash forces
+	# FAILED even if a pass line is somehow also present.
+	mem_fail=$(cat $fn | grep -E "Tests leaked   :    [1-9]|LEAKED TEST SUMMARY|Segmentation fault|AddressSanitizer|DEADLYSIGNAL|definitely lost|Invalid read|Invalid write|Invalid free|heap-use-after-free|heap-buffer-overflow|stack-buffer-overflow|stack-overflow" | head -1)
+
+	if [[ -z $string ]] || [[ -n $mem_fail ]]; then
 	    echo "FAILED\n"
 	else
 	    echo "success\n"
-	fi	
+	fi
 }
 
 get_err_msg() {
-	string=$(cat $fn)
-	echo $string 
-	
+	# Cap the message file too -- the raw log may be large.
+	head -c 200000 $fn
+
 }
 
 
 get_status > "${fix_log}.status"
- 
-get_err_msg > "${fix_log}.msg" 
 
-
+get_err_msg > "${fix_log}.msg"

@@ -9,9 +9,19 @@ test_log=$2
 	
 	cmake \
 	$cmake_flags \
+	-DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST \
 	-G Ninja -B $build_dir 
 
 
+{%else%}
+	# Rebuild path (slot rescore): rsync'd CTestTestfile.cmake + *_tests.cmake reference
+	# the parent's build_dir path and were generated under POST_BUILD gtest discovery.
+	# Both break inside the slot. Reconfigure to regenerate them with PRE_TEST so ctest
+	# rediscovers at runtime against the current path.
+	if [ ! -f "$build_dir/CTestTestfile.cmake" ] || ! grep -q "$build_dir" "$build_dir/CTestTestfile.cmake" 2>/dev/null; then
+		cmake_flags="{{build_flags|join(" ") }}"
+		cmake $cmake_flags -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST -G Ninja -B $build_dir
+	fi
 {%endif%}
 
 

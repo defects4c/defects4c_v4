@@ -6,11 +6,11 @@ build_flags=" {% for option in build_flags %}{{ option }} {% endfor %} ";
 
 
 {% if not is_rebuild %}
-	autoreconf -i 
+	autoreconf -i
 
 #	 --enable-asan    \
 #	 --enable-ubsan    \
-#	       CFLAGS="-O2 -pthread -fstack-protector-all" 	
+#	       CFLAGS="-O2 -pthread -fstack-protector-all"
 #	 --enable-error-injection             \
 
 
@@ -19,15 +19,25 @@ build_flags=" {% for option in build_flags %}{{ option }} {% endfor %} ";
 	 --disable-docs        \
 	      --disable-valgrind             \
 	      --with-oniguruma=builtin \
-	       CFLAGS="-O2 -pthread " 	
- 
- 
+	       CFLAGS="-O2 -pthread "
+
+
 
 {% endif %}
+
+# Slot-rebuild fallback: if the slot tree is missing Makefile (incomplete copy),
+# re-run autoreconf + configure so the generated source files (e.g. src/builtin.jq)
+# get materialized again.
+if [ ! -f Makefile ]; then
+	autoreconf -fi
+	./configure \
+	 --prefix=$fn \
+	 --disable-docs \
+	      --disable-valgrind \
+	      --with-oniguruma=builtin \
+	       CFLAGS="-O2 -pthread "
+fi
 
 
 
 make -j {{cpu_count}}
-
-
-

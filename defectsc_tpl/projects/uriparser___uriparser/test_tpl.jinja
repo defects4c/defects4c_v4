@@ -9,18 +9,31 @@ fix_log_msg="${fix_log}.msg"
 cat /dev/null > $fn 
 
 
+# Plain "make check" (the original, known-good invocation). build_tpl compiled
+# liburiparser AND the gtest test binary with CC/CXX="g{cc,++} -fsanitize=address"
+# and LDFLAGS="-fsanitize=address", so the test binary is genuinely ASAN-linked
+# (nm <bin> | grep __asan > 0) and the CVE-2018-20721 OOB read in
+# TestIpSixOverread makes the BUGGY commit abort => make check returns non-zero
+# => FAIL. The fixed commit guards the read => PASS. We deliberately do NOT set
+# ASAN_OPTIONS here: ASAN aborts on the first error by default, and forcing extra
+# handlers caused the wild OOB read to loop instead of aborting cleanly.
 make -j {{cpu_count}} check 
 
 return_status=$?
 expect_status=0
 
 get_status() {
-	if [[ $expect_status == $return_status ]]; then 
-		    echo "success"
-	else
-		    echo "FAILED"
-	fi 
-	
+	# Primary signal: make check exit code.
+	if [[ $expect_status != $return_status ]]; then
+		echo "FAILED"; return
+	fi
+	# Robustness: an AddressSanitizer diagnostic in any test log means the buggy
+	# commit triggered the OOB read => record FAILED even if make returned 0.
+	if grep -qE "AddressSanitizer|heap-buffer-overflow|stack-buffer-overflow" \
+		test-suite.log test/test-suite.log test/uriparser_test.log "$fn" 2>/dev/null; then
+		echo "FAILED"; return
+	fi
+	echo "success"
 }
 
 get_err_msg() {
@@ -43,8 +56,4 @@ get_err_msg() {
 status_log=$( get_status)
 echo $status_log > "${fix_log}.status"
 
-get_err_msg  "${fix_log}.msg" 
-
-
-
-
+get_err_msg  "${fix_log}.msg"

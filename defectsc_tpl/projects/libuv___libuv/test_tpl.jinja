@@ -1,8 +1,7 @@
 
-test_log=$2 
+test_log=$2
 
-cat /dev/null > $test_log 
-
+cat /dev/null > $test_log
 
 
 username="defects4c_user"
@@ -11,48 +10,55 @@ username="defects4c_user"
 if id "$username" &>/dev/null; then
     echo "User $username already exists."
 else
-    # Create the user with the root group
-    useradd -G root "$username"
-    echo "User $username created with root group."
-	# Add user to sudo group without password
-	echo "$username ALL=(ALL) NOPASSWD: ALL" | sudo tee -a /etc/sudoers >/dev/null
-	echo "User $username added to sudo group without password."
+    # Create the user. Deliberately NOT in the root group: the libuv test
+    # harness refuses to run with root privileges.
+    useradd -m "$username"
+    echo "User $username created."
 fi
 
-
-
-
-
+work_dir=$(pwd)
+# The tree was built as root; let the unprivileged user execute/regenerate
+# test artifacts.
+chown -R "$username":"$username" "$work_dir" 2>/dev/null || true
 
 chmod 777 $test_log
-
-
-set +e 
- ( make -j  {{ cpu_count }}   check  >> $test_log 2>&1 ) || (  su - $username   -c "  make -j  {{ cpu_count }}   check  >> $test_log 2>&1 " )
-
-set -e 
-#sudo -u example_user sh -c "sudo  make -j  {{ cpu_count }}   check  >> $test_log 2>&1"  
-
-#make -j {{ cpu_count }}  check  >> $test_log 2>&1 
-
 
 
 fn=$(realpath $test_log )
 
 
+# Build the test runner (compiling as root is fine), then RUN the bug-specific
+# test as the unprivileged user (libuv refuses to run its tests as root).
+# Preserve cwd and give the user a real HOME.
+set +e
+make -j {{ cpu_count }} test/run-tests >> $test_log 2>&1
+su "$username" -s /bin/bash -c "export HOME=/home/$username; cd '$work_dir' && ./test/run-tests {{test_flags[0]}}" >> $test_log 2>&1
+set -e
+
+
+# FixOnly oracle: default to FAILED, flip to success ONLY on positive evidence
+# that the bug-specific test ran AND passed ("ok N - <test>") with no "not ok".
 get_status() {
-	string=$(awk '/^not ok/,/^ok/' $test_log )
-	
-	if [[ $string =~ "{{test_flags[0]}}" ]]; then
-	    echo "FAILED\n"
-	else
-	    echo "success\n"
-	fi	
+	local tf="{{test_flags[0]}}"
+
+	if grep -qiE "cannot be run as root" $test_log ; then
+		echo "FAILED\n"; return
+	fi
+
+	if grep -qE "^not ok([[:space:]]+[0-9]+)?[[:space:]]*-?[[:space:]]*${tf}([[:space:]]|$)" $test_log ; then
+		echo "FAILED\n"; return
+	fi
+
+	if grep -qE "^ok([[:space:]]+[0-9]+)?[[:space:]]*-?[[:space:]]*${tf}([[:space:]]|$)" $test_log ; then
+		echo "success\n"; return
+	fi
+
+	echo "FAILED\n"
 }
 
 get_err_msg() {
         msg_log=$1
-        awk '/^not ok/,/^ok/'  $test_log  > $msg_log
+        cp $test_log $msg_log 2>/dev/null || awk '/^not ok/,/^ok/'  $test_log  > $msg_log
 }
 
 
@@ -65,10 +71,4 @@ status_log=$( get_status)
 echo $status_log > "${fix_log}.status"
 
 
-get_err_msg "${fix_log}.msg" 
-
-
-
-#make distclean 
-
-## for reproduce 
+get_err_msg "${fix_log}.msg"

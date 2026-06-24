@@ -27,11 +27,50 @@ test_log=$2
 	
 	cmake \
 	$cmake_flags \
+	-DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST \
 	-G Ninja -B $build_dir 
 
 
+{%else%}
+	# Rebuild path (slot rescore). SPIRV-Tools uses gtest_discover_tests; the
+	# build-generated CTestTestfile.cmake / *_tests.cmake / *_include.cmake and
+	# CMakeCache.txt bake ABSOLUTE paths to the GOLDEN build_dir. After rsync into a
+	# pool slot (__sN), stale slots point ctest at "<golden>/build_<sha>/..." so ctest
+	# runs the GOLDEN binary (stale source) instead of the freshly-rebuilt slot binary
+	# -> fix-mode scores the wrong code. Self-heal, independent of slot-creation timing.
+	#
+	# slot=$(pwd); golden = slot minus trailing /__sN. Rewrite the EXACT stale token
+	# "<golden>/build_" -> "<slot>/build_" (anchoring on "/build_" is idempotent: a
+	# healthy slot path "<golden>/__sN/build_" does not contain "<golden>/build_").
+	# FAST GUARD: only walk the (huge) build tree if a sentinel CTest file still
+	# references the golden path; healthy slots skip the expensive find entirely.
+	slot_abs="$(pwd)"
+	golden_abs="$(printf "%s" "$slot_abs" | sed -E "s#/__s[0-9]+\$##")"
+	if [ "$slot_abs" != "$golden_abs" ] && [ -d "$build_dir" ]; then
+		need_heal=0
+		for sentinel in "$build_dir/CTestTestfile.cmake" "$build_dir/CMakeCache.txt"; do
+			if [ -f "$sentinel" ] && grep -qF -- "${golden_abs}/build_" "$sentinel" 2>/dev/null; then
+				need_heal=1; break
+			fi
+		done
+		# Deep sentinel: a representative gtest discovery file (test subtree).
+		if [ $need_heal -eq 0 ]; then
+			d=$(find "$build_dir/test" -maxdepth 3 -name "CTestTestfile.cmake" -print -quit 2>/dev/null)
+			[ -n "$d" ] && grep -qF -- "${golden_abs}/build_" "$d" 2>/dev/null && need_heal=1
+		fi
+		if [ $need_heal -eq 1 ]; then
+			find "$build_dir" \
+				\( -name "CTestTestfile.cmake" -o -name "CMakeCache.txt" \
+				   -o -name "DartConfiguration.tcl" -o -name "cmake_install.cmake" \
+				   -o -name "*_tests.cmake" -o -name "*_include.cmake" \
+				   -o -name "CTestConfiguration.ini" \) -type f -print0 \
+			| xargs -0 -r grep -lZF -- "${golden_abs}/build_" 2>/dev/null \
+			| xargs -0 -r sed -i "s#${golden_abs}/build_#${slot_abs}/build_#g"
+			# Regenerate gtest discovery only after a heal.
+			[ -f "$build_dir/CMakeCache.txt" ] && cmake -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST $build_dir >/dev/null 2>&1 || true
+		fi
+	fi
 {%endif%}
 
 
-ninja -C $build_dir 
-
+ninja -C $build_dir

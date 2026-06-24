@@ -7,7 +7,9 @@
     "before_install": [],
     "c_compile": {
         "build": "ninja",
-        "build_flags": ["-DFMT_TEST=on"],
+        "build_flags": [
+            "-DFMT_TEST=on"
+        ],
         "test": "ctest",
         "test_flags": [],
         "clean": "git"

@@ -19,6 +19,10 @@ sh -c "${build_dir}/src/libmongoc/test-libmongoc -l '/bson/validate' "   2> $fix
 
 
 get_status() {
+	if [[ ! -s "$fn" ]] || ! grep -q "status" "$fn" ; then
+	    echo "FAILED\n"
+	    return
+	fi
 	string=$(cat $fn |grep "status\": \"FAIL")
 	
 	if [[ -z $string ]] ; then 

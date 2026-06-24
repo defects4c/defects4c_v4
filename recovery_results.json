@@ -1,0 +1,436 @@
+[
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "26a6799b9ca80508c05cac7a9a3bef922991520b",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "985122081165753c7442bd7824c473eb9ff56308",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "bd4e697ebd6c8457efa8f28f6831fc929b88a014",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "d10a0f980fe8f9407ab1ffbd612641433ebe175e",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "7335163a6ef82d46ff18f3e6099a157747241629",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "a7e5f58f402e6919ec444a57946bade7dfd6b184",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "29e5470e6ab84badbc31f4532bb7554a796d9d52",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "8512734883227c11568bb35da1d48b9f8466f43f",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "331530a4076c69bbd2e3214db6ccbe834fb75640",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "289c672020280529fd382f3502efab7100d638ec",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "4601c685e7fd19c3724d5e499c69b8d3ec49933e",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "5edf405d7ed9fc92f4f43e8a3d44baa4c6387562",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "ffde45acf3348f8353fb4064a1b21683ee6b5ddf",
+    "fix": "FAIL",
+    "buggy": "FAIL",
+    "verdict": "FAIL/FAIL"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "11b426ee05eb62ed103218526f1fa616851c43ce",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "7d3aba9f06899d0128ef46e8a2fa143c6fad8f62",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "0cb1b8a434b599b8d636db029aadb757c24e39d6",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "061e7371a944588f231cb1b66d6fb070b646e376",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "8509ef02eceb2bbb479cea10fe4a7ec6395f1a8b",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "571a6f33f47e7a2394fa08f925e534135c29cf1e",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "b45a9a167ca6a3ef2752ae9d48d56ac14b001bfd",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "7a923447fd49a069a0fd3b6c3547438ab5ee2123",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "42073d54c53a496be40ae84152bbfe2c923ac7bc",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "da6f1a677bfa4476abaeaf9b1afe1c4390f51b41",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "2b62d1dda41590db29368ec7ba5f4faf3464765a",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "e6511cc1a950fe1566b2236329d6b4bd0826cc7a",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "2d669862df7cd17f539129049f6fb70d17174125",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "5d0d76e88ee2d3236d7e032589d6f1d4ec5f7b1e",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "6f5ba2b651cd9d4b7fa8ee5c4f94460645877c45",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "a77ff09c46560bc895dea11dc9fe643486b056ac",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "3a76fd7c95fced2c2f8c8148a9055c3a542eff29",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "c2f6833dddecf2d5fb89c9c898eee9981da342ed",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "3c8a2b0e91d8d8947e89384dacf6b54673083e71",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "aa0858100096a3490edf93034a80e66a4d61aad5",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "f76e7feb41a4327d2b0978449bbdafe98d4a3771",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "f4b9e24c7384d882a7f434cc7413925bf871d63e",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "1bc78d795cd5cad5525498658f414a11ea0a7e9c",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "67c7126062d59729cd421bb38f9594015c9907ba",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "88b2dac837e81cf56dce05e6e7b5989332c0092d",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "b8e559afaeb8fe0604a1f8e3ad4dc1445de07a00",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "e942fb84fbe3a73a98a00d2a279425872b5fb9d2",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "979dcefd7b259e9e233f77fe1c5312793bfd948f",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "c5dd7bef5e54da5996dc4713284aa6266ae75b75",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "6fca58f5f9c96749a575f52e20598ad43f5bdf30",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "8934a7d6307267d301182f19ed162563717e29e3",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "39582c04cc5e34054b2936b423072fb9df2ff6ef",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "ca336198e8bebccc18502de27672fdbd6eb34856",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "the-tcpdump-group___tcpdump",
+    "sha": "3b32029db354cbc875127869d9b12a9addc75b50",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "4fa1a6f9b497193e54a814112f17ab3c2cf58053",
+    "fix": "FAIL",
+    "buggy": "FAIL",
+    "verdict": "FAIL/FAIL"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "0391d0823ebfd7c37c07a54b8726cc417183a95f",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "948577c5df3a6f0d337ab417b26edcc344eb65e2",
+    "fix": "FAIL",
+    "buggy": "FAIL",
+    "verdict": "FAIL/FAIL"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "0a5d99d02cb8c0edd41c7a9d4f309c0974d076d0",
+    "fix": "FAIL",
+    "buggy": "FAIL",
+    "verdict": "FAIL/FAIL"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "6a9be627c760cf1efa43d155d4e6ee5e801deba3",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "ab3cdcaef56e9311f299eebfd044f9646100c9dc",
+    "fix": "FAIL",
+    "buggy": "FAIL",
+    "verdict": "FAIL/FAIL"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "286b3095dd187da747f85baf9ce3120580565df0",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "0a43a84e02245cca40ce187d1e427a5d0b4f3d13",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "54385458ca2f7a7b06699e441822753dbc2d018d",
+    "fix": "FAIL",
+    "buggy": "FAIL",
+    "verdict": "FAIL/FAIL"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "d5a3bfcf2ffd154a244e7ffae54dd1766d98efa4",
+    "fix": "PASS",
+    "buggy": "PASS",
+    "verdict": "PASS/PASS"
+  },
+  {
+    "proj": "KhronosGroup___SPIRV-Tools",
+    "sha": "0ad83f9139daf70a791560f5c72f94b0be5b8390",
+    "fix": "FAIL",
+    "buggy": "FAIL",
+    "verdict": "FAIL/FAIL"
+  },
+  {
+    "proj": "OpenIDC___cjose",
+    "sha": "7325e9a5e71e2fc0e350487ecac7d84acdf0ed5",
+    "fix": null,
+    "buggy": null,
+    "verdict": "None/None"
+  },
+  {
+    "proj": "VirusTotal___yara",
+    "sha": "4a342f01e5439b9bb901aff1c6c23c536baeeb3f",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  },
+  {
+    "proj": "facebook___rocksdb",
+    "sha": "1d2950b8dd3899ad22c889c7976dde3efb56dde0",
+    "fix": null,
+    "buggy": null,
+    "verdict": "None/None"
+  },
+  {
+    "proj": "Yeraze___ytnef",
+    "sha": "3cb0f914d6427073f262e1b2b5fd973e3043cdf7",
+    "fix": "PASS",
+    "buggy": "FAIL",
+    "verdict": "PASS_BOTH"
+  }
+]

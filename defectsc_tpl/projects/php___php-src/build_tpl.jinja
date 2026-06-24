@@ -4,8 +4,8 @@ build_dir=$1
 bison_path=$(realpath "../dep_dirs")
 mkdir -p $bison_path
 
-if [[ ! -d $bison_path"/bison-2.7/bison-2.7_bin" ]]; then 
-	cur_dir=$(pwd)	
+if [[ ! -d $bison_path"/bison-2.7/bison-2.7_bin" ]]; then
+	cur_dir=$(pwd)
 
 
 
@@ -25,7 +25,7 @@ if [[ ! -d $bison_path"/bison-2.7/bison-2.7_bin" ]]; then
 
 
 
-	tar -xf bison-2.7.tar.gz 
+	tar -xf bison-2.7.tar.gz
 
 	cd "bison-2.7"
 
@@ -37,10 +37,10 @@ if [[ ! -d $bison_path"/bison-2.7/bison-2.7_bin" ]]; then
 
 	make -j $(nproc)
 
-	make install 
+	make install
 
 	cd $cur_dir
-fi 
+fi
 
 
 export PATH=$bison_path"/bison-2.7/bison-2.7_bin/bin/":$PATH
@@ -55,7 +55,7 @@ build_flags=" {% for option in build_flags %}{{ option }} {% endfor %} ";
 
 {% if not is_rebuild %}
 	./buildconf --force
-	
+
 	./configure \
 	--quiet \
 	$build_flags \
@@ -69,13 +69,107 @@ build_flags=" {% for option in build_flags %}{{ option }} {% endfor %} ";
 	--enable-mbstring \
 	 --enable-shared=Yes \
 	  --enable-static=No \
-	CFLAGS="-Wno-error" CXX=g++ CC=gcc   
+	CFLAGS="-Wno-error" CXX=g++ CC=gcc
 
+{% else %}
+	# Rebuild path: if a previous step wiped Makefile, regenerate it.
+	if [ ! -f Makefile ]; then
+		./buildconf --force
+		./configure \
+		--quiet \
+		$build_flags \
+		--enable-phpdbg \
+		--enable-fpm \
+		--without-pear \
+		--enable-sysvsem \
+		--enable-sysvshm \
+		--enable-shmop \
+		--enable-pcntl \
+		--enable-mbstring \
+		 --enable-shared=Yes \
+		  --enable-static=No \
+		CFLAGS="-Wno-error" CXX=g++ CC=gcc
+	fi
 {% endif %}
 
 
+{% if is_rebuild %}
+# Self-heal an incomplete pool slot. A slot (the cwd, git_repo_dir_<sha>/__sN)
+# is an rsync copy of the golden parent (".."). When that copy is interrupted
+# (it is ~500 MB and the host is heavily loaded) the slot ends up MISSING
+# source files (e.g. ext/pcre/pcrelib/*.c), object files and whole .libs dirs,
+# and an incremental make then dies with
+#   mkdir: cannot create directory ".../.libs": No such file or directory
+# or
+#   gcc: error: .../.libs/foo.o: No such file or directory
+# Fill in ONLY the files the slot is missing from the complete golden tree in
+# "..", WITHOUT overwriting the bug-specific src_file already in place
+# (--ignore-existing). Cheap when the slot is already complete.
+golden_parent=".."
+if [ -d "$golden_parent/sapi" ] && [ ! -x "sapi/cli/php" ]; then
+	rsync -a --ignore-existing \
+		--exclude=__s* --exclude=.git --exclude=*.lock \
+		--exclude=inplace_*.sh --exclude=run_*.sh \
+		"$golden_parent/" ./ 2>/dev/null || true
+fi
 
-make -j {{ cpu_count }} 
+# ----------------------------------------------------------------------
+# Slot-source coherence fix (ORACLE CORRECTNESS).
+#
+# A pool slot (the cwd, git_repo_dir_<sha>/__sN) was configured by running
+# ./configure in the GOLDEN parent tree, so every generated Makefile carries
+#     srcdir     = /out/.../git_repo_dir_<sha>
+#     top_srcdir = /out/.../git_repo_dir_<sha>
+# i.e. it points at the GOLDEN tree, NOT at this slot. The build rule for a
+# source object is `$(LIBTOOL) ... -c $(srcdir)/path/to/file.c -o file.lo`,
+# so an incremental rebuild in the slot COMPILES THE GOLDEN SOURCE and simply
+# ignores the (possibly buggy) src_file the oracle dropped into the slot.
+# Result: the oracle's "buggy" build silently rebuilds the FIXED golden code
+# and the bug never reproduces (false PASS in buggy mode).
+#
+# Fix: repoint the source-directory make variables at THIS slot (its absolute
+# path == $(pwd)). Include-flag paths (-I.../golden/...) are left untouched --
+# the headers are identical, and rewriting them risks recursive prefix bugs
+# since the slot path contains the golden path as a prefix. We only rewrite
+# the bare `<var> = <golden>` assignment lines.
+slot_abs="$(pwd)"
+golden_abs="$(cd .. && pwd)"
+if [ "$slot_abs" != "$golden_abs" ]; then
+	for mk in Makefile $(find ext main Zend TSRM sapi -maxdepth 4 -name Makefile 2>/dev/null); do
+		[ -f "$mk" ] || continue
+		for v in srcdir top_srcdir abs_srcdir; do
+			sed -i -E "s#^(${v}[[:space:]]*=[[:space:]]*)${golden_abs}\$#\\1${slot_abs}#" "$mk" 2>/dev/null || true
+		done
+	done
+fi
+
+# Force the bug-specific src_file's object(s) to be recompiled from the slot
+# copy. PHP 5.x Makefiles do NOT list the .c as a prerequisite of its .lo
+# target, so even with srcdir fixed `make` would consider a touched source
+# "up to date" and skip it. Deleting the libtool wrapper (.lo) and both the
+# PIC (.libs/<base>.o) and non-PIC (<base>.o) objects forces a clean recompile,
+# and removing the final php binaries forces a relink.
+{% if src_file %}
+src_rel="{{ src_file }}"
+src_dir="$(dirname "$src_rel")"
+src_base="$(basename "$src_rel" .c)"
+rm -f "$src_dir/$src_base.lo" \
+      "$src_dir/.libs/$src_base.o" \
+      "$src_dir/$src_base.o" \
+      "sapi/cli/php" "sapi/cgi/php-cgi" 2>/dev/null || true
+{% endif %}
+{% endif %}
 
 
+# Pre-create the .libs directory next to every libtool object dir, to avoid the
+# libtool "mkdir: cannot create directory .libs" race under parallel make. The
+# race affects every dir that links a .lo, not just ext/mbstring/libmbfl.
+precreate_libs() {
+	for d in $(find ext sapi main Zend TSRM -type d 2>/dev/null); do
+		mkdir -p "$d/.libs" 2>/dev/null || true
+	done
+	mkdir -p ext/mbstring/libmbfl/filters/.libs ext/mbstring/libmbfl/mbfl/.libs ext/mbstring/libmbfl/nls/.libs 2>/dev/null || true
+}
+precreate_libs
 
+make -j {{ cpu_count }} || { precreate_libs; make -j 1; }

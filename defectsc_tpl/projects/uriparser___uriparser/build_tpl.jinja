@@ -62,12 +62,28 @@ set -e
 	 ) || ( echo "cannot inita" && exit 1 )
 	
 	
-	./configure   --prefix=$fn 
+	CC="gcc -fsanitize=address" CXX="g++ -fsanitize=address" LDFLAGS="-fsanitize=address" ./configure   --prefix=$fn 
 
 {% endif %}
 
 
 set +e 
 
-make -j {{ cpu_count }}   
-
+# CVE-2018-20721 (cef25028) reproduces only if the gtest TEST BINARY is itself
+# AddressSanitizer-instrumented: the OOB read is on a buffer owned by test.cpp,
+# so without redzones in the TEST object ASAN cannot see it. The checked-out slot
+# ships STALE pre-compiled, NON-asan test objects whose mtime makes make consider
+# them up-to-date, so it relinks an UNINSTRUMENTED test binary
+# (nm uriparser_test | grep -c __asan == 0) and the buggy commit wrongly PASSES.
+# For THIS bug only, purge the test objects so they recompile with
+# CC/CXX="g{cc,++} -fsanitize=address" and the test binary is truly ASAN-linked.
+# Scoped to the cef sha because other uriparser bugs use a different toolchain
+# (e.g. 864f5d4c links the test with clang++ and would fail to resolve __asan_*
+# symbols if forced to relink against the asan-instrumented library).
+if [[ $test_log =~ "cef25028de5ff872c2e1f0a6c562eb3ea9ecbce4" ]]; then
+	rm -f test/*.o test/.deps/*.Po 2>/dev/null || true
+	rm -f test/uriparser_test test/.libs/uriparser_test 2>/dev/null || true
+	make -j {{ cpu_count }} CC="gcc -fsanitize=address" CXX="g++ -fsanitize=address" LDFLAGS="-fsanitize=address"
+else
+	make -j {{ cpu_count }} LDFLAGS="-fsanitize=address"
+fi

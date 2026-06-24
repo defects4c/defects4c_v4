@@ -1,78 +1,142 @@
-# Defects4C v2 — Defects4J-Compatible API for C/C++ Bug Benchmarks
+# Defects4C — C/C++ Bug Reproduction & Patch Validation Backend
 
-A Defects4J-style HTTP service for C/C++ bug reproduction and automated patch validation,
-built on top of the proven `bug_helper_v1_out2.py` workflow.
+A Defects4J-style HTTP service (FastAPI on port **8095**) for reproducing and
+validating fixes to C/C++ bugs. Used by every APR pipeline in
+`agent_apr_d4c/*` to checkout, compile, and test patched code.
+
+For Claude Code session breadcrumbs (hard rules, slot architecture, recovery)
+see [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
 
 ## Quick Start
 
 ```bash
-# 1. Ensure host mount dirs exist
-mkdir -p out_tmp_dirs patche_dirs workspace
+# 1. Build & start (auto-detects host UID/GID)
+make up
 
-# 2. Build and start
-docker-compose up -d --build
+# 2. Verify
+curl -s http://127.0.0.1:8095/health     # → {"status":"ok"}
 
-# 3. Warmup: full-clone cppcheck + reproduce 6 verified bugs (~15 min)
-docker exec defects4c_v2_defects4c_1 bash /src/run_warmup_selected.sh
+# 3. List bugs
+curl -s http://127.0.0.1:8095/list_defects_bugid | jq -r '.[]' | wc -l   # → 114
 
-# 4. Verify
-python3 http_tutorial.py --list         # show 6 verified bugs
-python3 http_tutorial.py --oracle 0     # oracle check (fix=PASS, buggy=FAIL)
-python3 http_tutorial.py --bug 0        # full tutorial with LLM
+# 4. Inspect one defect
+curl -s http://127.0.0.1:8095/get_defect/danmar___cppcheck@caa6ff7c | jq .
 ```
 
-## Verified Bugs (6 cppcheck, 2021–2022)
+To bring the service down: `make down`. To bounce after editing
+`defectsc_tpl/`: `make restart`.
 
-All compile with clang-16 and pass oracle validation (fix→PASS, buggy→FAIL):
+## Benchmark scope
 
-| # | SHA | Source | Trigger Filter | Description |
-|---|-----|--------|----------------|-------------|
-| 0 | caa6ff7c | lib/analyzerinfo.cpp | TestAnalyzerInformation | Control Expression Error |
-| 1 | d0b6079a | lib/checkcondition.cpp | TestCondition | Condition logic bug |
-| 2 | 398fa280 | lib/valueflow.cpp | TestStl | ValueFlow STL container bug |
-| 3 | c4dcfef3 | lib/tokenize.cpp | TestSymbolDatabase | Tokenizer symbol database bug |
-| 4 | 4779f0e1 | lib/templatesimplifier.cpp | TestSimplifyTemplate | Template simplifier bug |
-| 5 | 192c30ab | lib/tokenize.cpp | TestTokenizer | Tokenizer crash bug |
+| | Value |
+|---|---|
+| Bug count | **114** across 46 projects |
+| Source of truth | `defectsc_tpl/projects/<project>/bugs_list_new.json` |
+| Pool slots per bug | 3 (`__s0`, `__s1`, `__s2`) — fcntl-locked |
+| Internal container port | 11111 (mapped to host 8095) |
+| Workers | 4 gunicorn processes |
 
-## Tutorial Workflow
+## Tutorial Workflow (called by all APR pipelines)
 
 ```
-Step 0:  Health check
-Step 1:  Select bug (from selections.txt produced by warmup)
-Step 2:  Get defect metadata (FL info, trigger/regression tests)
-Step 3:  Checkout buggy source (git checkout commit_before -- src_file)
-Step 4:  Compile (incremental ninja rebuild)
-Step 5:  Trigger test (should FAIL on buggy code)
-Step 5b: Oracle validation (fix=PASS, buggy=FAIL)
-Step 6:  LLM generates patch
-Step 7:  Build patch file
-Step 8:  Submit fix (async)
-Step 9:  Poll for result
-Step 10: Regression test (only if fix passed; skipped otherwise)
+1.  Health check                  GET  /health
+2.  List defects                  GET  /list_defects_bugid
+3.  Get metadata + FL             GET  /get_defect/<project>@<sha>
+4.  Reproduce (provision slots)   POST /reproduce            ← async; provisions __s{0,1,2}
+5.  Checkout                      POST /checkout             ← reset a slot to buggy commit
+6.  Compile                       POST /compile              ← cmake + ninja in slot
+7.  Trigger test                  POST /trigger_test         ← FAIL on buggy code
+8.  Regression test               POST /regression_test      ← FAIL on buggy, PASS after fix
+9.  Async patch validate          POST /fix → GET /status/{handle}
+10. Slot release (best-effort)    POST /api/release_slot
 ```
 
 ## Key Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Liveness probe |
-| `/api/exec` | POST | D4J-style CLI interface |
-| `/checkout` | POST | Restore buggy source file |
-| `/compile` | POST | cmake + ninja build |
-| `/trigger_test` | POST | Run trigger tests only |
-| `/regression_test` | POST | Run full test suite |
-| `/validate_oracle` | POST | Oracle validation (fix/buggy) |
-| `/list_defects_bugid` | GET | List all bug IDs |
-| `/get_defect/{id}` | GET | Metadata + FL + prompt |
+| `/health` · `/health/deep` | GET | liveness / readiness probes |
+| `/api/exec` · `/api/exec-shell` | POST | D4J-style CLI bridge |
+| `/api/upload` · `/api/download` | POST · GET | file transfer to/from container |
+| `/checkout` | POST | reset slot to buggy commit |
+| `/compile` | POST | cmake + ninja in slot |
+| `/trigger_test` | POST | run trigger tests only |
+| `/regression_test` | POST | run full test suite |
+| `/reproduce` | POST | full clone + build + verify (provisions pool slots) |
+| `/api/release_slot` | POST | best-effort flock release |
+| `/list_defects_bugid` | GET | list all 114 bug IDs |
+| `/get_defect/{id}` | GET | metadata + FL + LLM prompt |
 | `/build_patch` | POST | LLM response → patch file |
-| `/fix` | POST | Async patch validation |
-| `/status/{handle}` | GET | Poll fix result |
+| `/fix` · `/status/{handle}` | POST · GET | async patch validation |
+| `/projects` | GET | list known projects |
+| `/validate_oracle` | POST | oracle correctness check |
+
+Full schema: [`openapi.yaml`](openapi.yaml). FastAPI source: `defectsc_tpl/webapp.py`.
 
 ## Architecture
 
-- **Host disk**: `out_tmp_dirs/` holds cloned repos, build artifacts, logs (bind-mounted to `/out`)
-- **Container**: web service + compile + test using original `bug_helper_v1_out2.py`
-- **Warmup**: full-clones cppcheck once, per-bug local clone, `bug_helper_v1_out2.py reproduce` verifies each bug
+```
+                     host                                    container
+   ┌───────────────────────────────────┐         ┌──────────────────────────────┐
+   │  out/                             │  bind   │  /out/                       │
+   │    <proj>/git_repo_dir_<sha>/     │ ──────→ │    (regenerated on /reproduce)│
+   │      __s0/  __s1/  __s2/          │         │  fcntl.flock on __s{i}.lock  │
+   │  defectsc_tpl/                    │  bind   │  /src/  (live source)        │
+   │    webapp.py                      │ ──────→ │    gunicorn -w 4             │
+   │    bug_helper_v1_out2.py          │         │    listens on :11111         │
+   │  patche_dirs/                     │  bind   │  /patches/                   │
+   │  workspace/                       │  bind   │  /workspace/                 │
+   └───────────────────────────────────┘         └──────────────────────────────┘
+                                                       ↑
+                                  host:8095  ─────────┘
+```
 
-See **[guidance.md](guidance.md)** for regression test preparation and extending to new projects.
+- **`out/`** is **regenerated** by `/reproduce` — never hand-edit.
+- **`defectsc_tpl/`** is **live** — edit here and run `make restart` for changes to take effect.
 
+See **[guidance.md](guidance.md)** for adding new projects or extending the regression-test layer.
+
+## Container Management
+
+```bash
+make up       # build & start (auto-detects UID/GID into .env)
+make down     # stop & remove
+make logs     # tail container logs
+make restart  # restart after editing defectsc_tpl/
+make health   # quick /health probe
+make shell    # interactive shell inside the container
+make clean    # full teardown (containers + images + build cache)
+```
+
+## Slot Lock Recovery
+
+Pool slots use `fcntl.flock` per-gunicorn-worker. If a batch run is killed
+mid-flight, slots can stay locked and `/api/release_slot` is unreliable across
+workers. **The only reliable recovery is `make restart`**.
+
+```bash
+make restart
+until curl -s http://127.0.0.1:8095/health | grep -q ok; do sleep 1; done
+```
+
+Full explanation: see [`.claude/CLAUDE.md`](.claude/CLAUDE.md) → "Pool slot architecture (and why it's fragile)".
+
+## MD5-Stamped Status Invariant (2026-04-12)
+
+`cmd_puretest` writes status files whose path ends with the MD5 of the patched
+file's current contents. `trigger_pass=true` is only honored when the path's
+MD5 matches the file just tested. This eliminates stale-cache false positives
+and **must not be changed** without coordinated updates to all four
+`agent_apr_d4c/*` pipelines.
+
+## Consumers (APR pipelines that depend on this service)
+
+| Pipeline | Folder |
+|---|---|
+| SWE-Agent (D4C) | `agent_apr_d4c/sweagent_selfcontainedqwen_oai/` |
+| Agentless (D4C) | `agent_apr_d4c/agentless_selfcontainedv2/` |
+| RepairAgent (D4C) | `agent_apr_d4c/repairagent_selfcontainedqwen/` |
+| ReAct (D4C) | `agent_apr_d4c/cot_not_agent_baseline/` |
+
+Each pipeline's `.claude/CLAUDE.md` documents its specific contract with this
+service.

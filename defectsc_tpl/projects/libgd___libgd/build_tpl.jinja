@@ -1,40 +1,81 @@
 build_dir=$1
 test_log=$2
 
-export	 CXX=g++ 
-export 	 CC=gcc 
+export CXX=g++
+export CC=gcc
+
+# Build the library (and later the tests) with AddressSanitizer applied at MAKE
+# time only. We do NOT pass ASAN to ./configure: under -fsanitize=address some
+# of configure's runtime conftests hang with "AddressSanitizer:DEADLYSIGNAL".
+# ASAN makes the OOB/overflow PoCs terminate (instead of looping forever on a
+# corrupt read) so a genuinely vulnerable buggy commit is recorded as FAIL.
+ASAN_CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -Wno-error"
+ASAN_LDFLAGS="-fsanitize=address"
+
+# CVE-2016-10168 (commit 69d2fd2c) is a SIGNED INTEGER OVERFLOW at
+# nc = (*ncx) * (*ncy) in src/gd_gd2.c. ASAN does NOT detect signed integer
+# overflow, so under ASAN-only the buggy commit silently returns NULL and the
+# bug00354 test PASSES (recorded "not reproduce"). We additionally instrument the
+# libgd LIBRARY with UBSan signed-integer-overflow and make it abort
+# (non-recoverable) so the buggy multiply traps => buggy FAILs, while the fixed
+# commit ncx > INT_MAX / ncy guard avoids the overflow => fix PASSes. Scoped to
+# this bug sha only so other libgd bugs (which rely on ASAN alone) are unaffected.
+if [[ $test_log =~ "69d2fd2c597ffc0c217de1238b9bf4d4bceba8e6" ]]; then
+	UBSAN_EXTRA="-fsanitize=signed-integer-overflow -fno-sanitize-recover=all"
+	ASAN_CFLAGS="${ASAN_CFLAGS} ${UBSAN_EXTRA}"
+	ASAN_LDFLAGS="${ASAN_LDFLAGS} ${UBSAN_EXTRA}"
+fi
 
 
 {% if not is_rebuild %}
 
 	{{apt_install_fn}}
-	apt_install_fn autoconf 
-	apt_install_fn libtool 
+	apt_install_fn autoconf
+	apt_install_fn libtool
 	apt_install_fn automake
-	
-	if [[ -f bootstrap.sh ]]; then 
-		./bootstrap.sh 
-	fi 
-	
-	./configure    \
-	 --enable-static=no \
-	--enable-shared=yes \
-	--with-zlib \
-	 --with-png \
-	 --with-freetype \
-	  --with-fontconfig \
-	  --with-jpeg \
-	   --with-xpm \
-		 --with-tiff \
-		  --with-webp 
+
+	if [[ -f bootstrap.sh ]]; then
+		./bootstrap.sh
+	fi
+
+	./configure --enable-static=no --enable-shared=yes --with-zlib --with-png --with-freetype --with-fontconfig --with-jpeg --with-xpm --with-tiff --with-webp CFLAGS="-Wno-error"
 
 {% endif %}
 
 
-if  [ ! -f "tests/gdimagefilltoborder/github_bug_215.c" ] && [[ $test_log =~ "77f619d48259383628c3ec4654b1ad578e9eb40e" ]] ; then 
+if  [ ! -f "tests/gdimagefilltoborder/github_bug_215.c" ] && [[ $test_log =~ "77f619d48259383628c3ec4654b1ad578e9eb40e" ]] ; then
  	## fix the 77f619d48259383628c3ec4654b1ad578e9eb40e
-	 wget https://raw.githubusercontent.com/libgd/libgd/b3190785bbe1d1cf768773474debcb58efcdba42/tests/gdimagefilltoborder/github_bug_215.c -O tests/gdimagefilltoborder/github_bug_215.c
-fi 
+		 wget https://raw.githubusercontent.com/libgd/libgd/b3190785bbe1d1cf768773474debcb58efcdba42/tests/gdimagefilltoborder/github_bug_215.c -O tests/gdimagefilltoborder/github_bug_215.c
+fi
 
 
-make CFLAGS="-Wno-error" -j {{cpu_count}} 
+# The validation slot (the cwd) is a SPARSE copy missing most of the tests/ tree
+# (e.g. tests/gdtest/gdtest.c and many tests/*/Makemodule.am), which breaks
+# "make check". The sibling parent dir (..) holds the COMPLETE source tree; fill
+# in only the files the slot is missing, WITHOUT overwriting the bug-specific
+# files already checked out here.
+#
+# IMPORTANT: the parent tests/ tree can accumulate MULTI-GIGABYTE per-test *.log
+# files (a buggy binary that loops on a corrupt read writes unbounded output).
+# A plain "rsync -a" tries to copy those giant logs and TIMES OUT before it ever
+# reaches the source files we actually need (gdtest.c, tga/heap_overflow.c, ...),
+# which left the slot un-buildable so "make check" produced no result and the
+# buggy commit was silently recorded as PASS. Exclude the disposable build/run
+# artifacts (*.log/*.trs/*.o and .deps/.libs) so the copy is small and reliable,
+# and proactively purge any huge stale logs from the parent so they cannot recur.
+find ../tests -type f -name '*.log' -size +50M -delete 2>/dev/null || true
+if [ -d ../tests ]; then
+	rsync -a --ignore-existing \
+		--exclude='*.log' --exclude='*.trs' --exclude='*.o' \
+		--exclude='.deps/' --exclude='.libs/' \
+		../tests/ tests/ 2>/dev/null || cp -rn ../tests/. tests/ 2>/dev/null || true
+fi
+
+
+# Make the already-generated build files the newest in the tree, and stub out
+# the maintainer-mode tools, so automake never tries to regenerate
+# tests/Makefile.in from the (partially missing) Makemodule.am includes.
+find . \( -name 'configure' -o -name 'aclocal.m4' -o -name 'Makefile.in' -o -name 'Makefile' -o -name 'config.status' -o -name '*.h.in' -o -name 'config.h' \) -exec touch {} + 2>/dev/null || true
+
+
+make AUTOMAKE=: AUTOCONF=: ACLOCAL=: AUTOHEADER=: MAKEINFO=: CFLAGS="${ASAN_CFLAGS}" CXXFLAGS="${ASAN_CFLAGS}" LDFLAGS="${ASAN_LDFLAGS}" -j {{cpu_count}}

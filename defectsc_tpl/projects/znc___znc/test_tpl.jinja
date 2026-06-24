@@ -1,7 +1,16 @@
 build_dir=$1
 test_log=$2
 
-make -j {{ cpu_count }}   inttest > /dev/null   2>&1 
+# `su - $username` (login shell) resets cwd to the user's HOME, which is why a
+# bare `./inttest` was failing with "No such file or directory". Remember the
+# source/build dir here and cd back into it inside the su -c invocation.
+run_dir="$(pwd)"
+
+make -j {{ cpu_count }}   inttest > /dev/null   2>&1
+if [ ! -x ./inttest ]; then
+  echo "BUILD_FAILED: inttest binary not built" > "$test_log"
+fi
+
 
 username="defects4c_user"
 
@@ -18,7 +27,11 @@ else
 fi
 
 
-
+# ZNC refuses to run --makeconf as root, so the integration test must run as an
+# unprivileged user. That user therefore needs to traverse into and read/exec
+# the build tree (inttest binary + installed znc under build_dir/bin).
+chmod -R a+rX "$run_dir" 2>/dev/null
+chmod a+x "$run_dir/inttest" 2>/dev/null
 
 
 
@@ -29,13 +42,16 @@ cat /dev/null > "${test_log}.xml"
 chmod 777 "${test_log}.xml"
 
 ##GTEST_OUTPUT=xml:"${test_log}.xml"   su - $username   -c "  ./inttest --gtest_filter='*StatusEchoMessage*:*AwayNotify*'  >>  $test_log 2>&1    "
-##GTEST_OUTPUT=xml:"${test_log}.xml" ./inttest --gtest_filter="{{ test_flags|join(', ') }}"   >>  $test_log 2>&1 
+##GTEST_OUTPUT=xml:"${test_log}.xml" ./inttest --gtest_filter="{{ test_flags|join(', ') }}"   >>  $test_log 2>&1
 
 
 
 #su - $username   -c "  GTEST_OUTPUT=xml:${test_log}.xml   ./inttest --gtest_filter='{{ test_flags|join(', ') }}'  >>  $test_log 2>&1   "
 
-su - $username   -c " ./inttest --gtest_filter='{{ test_flags|join(', ') }}'  --gtest_output=xml:$test_log.xml  >>  $test_log 2>&1   "
+# Run from $run_dir (su - resets cwd to HOME). The integration test spins up a
+# real znc process and answers --makeconf prompts over a pipe; under heavy host
+# load this is slow, so allow a generous wall-clock budget before giving up.
+su - $username   -c " cd '$run_dir' && timeout 1200 ./inttest --gtest_filter='{{ test_flags|join(', ') }}'  --gtest_output=xml:$test_log.xml  >>  $test_log 2>&1   "
 
 
 
@@ -43,7 +59,7 @@ su - $username   -c " ./inttest --gtest_filter='{{ test_flags|join(', ') }}'  --
 get_status() {
 	string=$(cat $test_log )
 	
-    if [[ $string == *"==ERROR"* ]] || [[ $string == *"FAILED"* ]] || [[ $string == *"AddressSanitizer:"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] ; then	    
+    if [[ $string == *"==ERROR"* ]] || [[ $string == *"FAILED"* ]] || [[ $string == *"AddressSanitizer:"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] || [[ $string == *"Segmentation fault"* ]] || [[ $string == *"core dumped"* ]] || [[ $string == *"BUILD_FAILED"* ]] || [[ $string == *"No such file or directory"* ]] || [[ $string == *"[exception]:"* ]] || [[ -z "$string" ]] ; then	    
     	echo "FAILED\n"
 	else
 	    echo "success\n"
@@ -64,6 +80,4 @@ echo $fix_log"---->"
 status_log=$( get_status)
 echo $status_log > "${fix_log}.status"
 
-get_err_msg  "${fix_log}.msg" 
-
-
+get_err_msg  "${fix_log}.msg"

@@ -6,20 +6,23 @@ All build/test logic lives here. webapp.py wraps these as HTTP endpoints.
 Commands:
   reproduce  <bug_id>               Full reproduce (warmup, run ONCE)
   fix        <bug_id> <patch_path>  Copy patch → src_file, rebuild, test
-  checkout   <bug_id>               git checkout buggy src_file
+  checkout   <bug_id>               Acquire pool slot, restore buggy src_file
   compile    <bug_id>               Check build_dir exists (warmup already built)
   test       <bug_id>               Pure rebuild + test (src_file already edited)
   info       <bug_id>               Print bug metadata
+  release_slot <bug_id> <slot_path> Release a previously acquired pool slot
 
 bug_id format: project@sha  (short sha supported)
 
-Architecture:
-  warmup (reproduce) runs ONCE via run_reproduce.sh.
-  After warmup, the flow is always:
-    checkout → edit src_file → test (rebuild+run)
-  - cmd_checkout: restores buggy src from git
+Architecture (workspace pool):
+  warmup (reproduce) runs ONCE on the golden directory.
+  After warmup, create_pool_slots() pre-creates __s0/__s1/__s2 via rsync.
+  The flow is always:
+    checkout (acquire slot) → edit src_file → test (rebuild+run) → release_slot
+  - cmd_checkout: acquires a pool slot, restores buggy src from golden's git
   - cmd_fix: copies patch file into src, then rebuild+test
   - cmd_puretest: just rebuild+test (src already in place, do NOT touch it)
+  - cmd_release_slot: releases the pool slot lock
 """
 
 import sys
@@ -27,7 +30,36 @@ import os
 import json
 import shlex
 import subprocess
+import fcntl
 from os.path import join as opj
+
+import signal
+
+def _run_with_pgkill(cmd, cwd, stdout=None, stderr=None, timeout=1800, encoding="utf-8", errors="replace"):
+    """Run a subprocess in its own process group; on timeout, kill the entire group.
+    This prevents orphan grandchildren (e.g. autotest) from surviving."""
+    env = os.environ.copy()
+    env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0"
+    proc = subprocess.Popen(
+        shlex.split(cmd) if isinstance(cmd, str) else cmd,
+        cwd=cwd, stdout=stdout, stderr=stderr,
+        encoding=encoding, errors=errors,
+        env=env,
+        start_new_session=True,  # new process group
+    )
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Kill the entire process group
+        pgid = os.getpgid(proc.pid)
+        print(f"[_run_with_pgkill] TIMEOUT ({timeout}s) — killing pgid {pgid}", file=sys.stderr)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+    return proc
 
 import jmespath
 from jinja2 import Environment, FileSystemLoader
@@ -45,6 +77,32 @@ COMMON_META_INFO = dict(
     repo_dir=None, log_dir=None, build_dir=None, test_log=None,
     commit_after=None, commit_before=None, src_files=None,
 )
+
+
+def _gittree_dir(project, sha):
+    """Sibling-of-golden path holding the relocated .git for oracle history.
+
+    Layout: out/<project>/_gittree_<sha>/.git/  (sibling of git_repo_dir_<sha>/).
+    """
+    return os.path.join(ROOT_DIR, project, f"_gittree_{sha}")
+
+
+def _init_slot_git(slot):
+    """Init a slot as an empty git repo with a single baseline-buggy commit.
+
+    Lets the agent run `git add`/`git commit`/`git diff` from the slot WITHOUT
+    seeing oracle history. Idempotent: skips if .git already present.
+    """
+    if os.path.isdir(os.path.join(slot, ".git")):
+        return
+    subprocess.run(["git", "-C", slot, "init", "-q"], check=False, timeout=60)
+    subprocess.run(["git", "-C", slot, "add", "-A"], check=False, timeout=300)
+    subprocess.run(
+        ["git", "-C", slot,
+         "-c", "user.email=d4c@local", "-c", "user.name=d4c",
+         "commit", "-q", "-m", "baseline_buggy"],
+        check=False, timeout=120,
+    )
 
 
 def apt_install_tool():
@@ -105,22 +163,239 @@ def parse_bug_id(bug_id):
     return project, sha
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Workspace Pool Manager
+# ═══════════════════════════════════════════════════════════════
+
+POOL_SIZE = 3  # slots per bug
+
+def _slot_dir(golden_dir, slot_idx):
+    """Return path to slot directory."""
+    return os.path.join(golden_dir, f"__s{slot_idx}")
+
+def _lock_path(golden_dir, slot_idx):
+    """Return path to slot lock file."""
+    return os.path.join(golden_dir, f"__s{slot_idx}.lock")
+
+def acquire_slot(project, sha):
+    """Acquire a pool slot for the given bug. Returns (slot_path, lock_fd) or raises."""
+    golden = os.path.join(ROOT_DIR, project, f"git_repo_dir_{sha}")
+    for i in range(POOL_SIZE):
+        lock_file = _lock_path(golden, i)
+        try:
+            fd = open(lock_file, 'w')
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Got the lock — restore slot from golden
+            slot = _slot_dir(golden, i)
+            try:
+                _restore_slot(golden, slot, project, sha)
+            except Exception as _rest_exc:
+                print(f"[acquire_slot] _restore_slot failed for slot {i}: {_rest_exc}", file=sys.stderr)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    fd.close()
+                except:
+                    pass
+                continue
+            return slot, fd
+        except (IOError, OSError) as _slot_exc:
+            # Slot busy or open/flock failed, try next
+            try:
+                fd.close()
+            except:
+                pass
+            continue
+    raise RuntimeError(f"All {POOL_SIZE} pool slots busy for {project}@{sha}")
+
+def release_slot(lock_fd):
+    """Release a pool slot."""
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+    except:
+        pass
+
+def _fixup_cmake_paths(golden, slot, sha):
+    """After rsyncing from golden to slot, fix build-system-generated absolute
+    paths so they point to the slot instead of the golden.
+
+    Handles two cases:
+    1. cmake projects (build_{sha}/ subdir): fix build.ninja, CMakeCache.txt, etc.
+       Also neuters cmake's auto-regeneration rule in build.ninja.
+    2. configure/make projects (in-place): fix Makefile, libtool, config.status, etc.
+    """
+    import re as _re
+    targets = []
+
+    # ── Case 1: cmake build dir ──
+    build_dir = os.path.join(slot, f"build_{sha}")
+    if os.path.isdir(build_dir):
+        for pattern in ["build.ninja", "CMakeCache.txt", "DartConfiguration.tcl",
+                        "CTestTestfile.cmake", "cmake_install.cmake"]:
+            for root, dirs, files in os.walk(build_dir):
+                if pattern in files:
+                    targets.append(os.path.join(root, pattern))
+        # Also fix gtest-discovery cmake files (*_include.cmake, *_tests.cmake)
+        # These have brackets in filenames like test[1]_include.cmake and
+        # contain absolute paths to test binaries.
+        for root, dirs, files in os.walk(build_dir):
+            for fn in files:
+                if fn.endswith("_include.cmake") or fn.endswith("_tests.cmake"):
+                    targets.append(os.path.join(root, fn))
+
+    # ── Case 2: in-place configure/make (Makefile, libtool, config.status) ──
+    for pattern in ["Makefile", "libtool", "config.status", "config.log"]:
+        fpath = os.path.join(slot, pattern)
+        if os.path.isfile(fpath):
+            targets.append(fpath)
+
+    if not targets:
+        return
+    # Replace golden path with slot path in all config files
+    # Preserve original timestamps so ninja/make don't trigger full rebuilds.
+    for fpath in targets:
+        try:
+            st = os.stat(fpath)
+            orig_times = (st.st_atime, st.st_mtime)
+            with open(fpath, 'r', encoding='utf-8', errors='surrogateescape') as f:
+                content = f.read()
+            if golden not in content:
+                continue
+            content = content.replace(golden, slot)
+            # For build.ninja: neuter the cmake regeneration rule so ninja
+            # doesn't re-run cmake (which would write golden paths back).
+            if fpath.endswith("build.ninja"):
+                # Remove "build build.ninja: RERUN_CMAKE ..." block
+                content = _re.sub(
+                    r'^build build\.ninja: RERUN_CMAKE[^\n]*\n(?:  [^\n]*\n)*',
+                    '# cmake regeneration disabled for pool slot\n',
+                    content, flags=_re.MULTILINE)
+                # Also remove "build CMakeFiles/cmake.check_cache: ..." block
+                content = _re.sub(
+                    r'^build CMakeFiles/cmake\.check_cache[^\n]*\n(?:  [^\n]*\n)*',
+                    '', content, flags=_re.MULTILINE)
+            with open(fpath, 'w', encoding='utf-8', errors='surrogateescape') as f:
+                f.write(content)
+            # Restore original timestamps to avoid spurious rebuilds
+            os.utime(fpath, orig_times)
+        except Exception as e:
+            print(f"[_fixup_cmake_paths] WARN: {fpath}: {e}", file=sys.stderr)
+    print(f"[_fixup_cmake_paths] fixed {len(targets)} files in {slot}", file=sys.stderr)
+
+
+def _restore_slot(golden, slot, project, sha):
+    """Restore a slot to the buggy state by rsyncing from golden."""
+    # Find the src_file from metadata
+    version, src_project_dir = detect_version(project)
+    src_project = os.path.join(src_project_dir, project)
+    bugs_file = os.path.join(src_project, "bugs_list_new.json")
+    if not os.path.exists(bugs_file):
+        bugs_file = os.path.join(src_project, "bugs_list.json")
+    with open(bugs_file) as f:
+        meta_bugs = json.load(f)
+    meta = jmespath.search(f"[?commit_after=='{sha}']", meta_bugs)
+    if not meta:
+        raise RuntimeError(f"Bug {sha} not found in metadata")
+    src_file = jmespath.search("files.src[0]", meta[0]) or ""
+    commit_before = meta[0].get("commit_before", "")
+
+    # Pick the git source for the buggy src_file: relocated _gittree wins,
+    # legacy in-place golden/.git is the fallback for unmigrated bugs.
+    gittree = _gittree_dir(project, sha)
+    gittree_git = os.path.join(gittree, ".git")
+    if os.path.isdir(gittree_git):
+        git_show_cmd = ["git", f"--git-dir={gittree_git}", "show", f"{commit_before}:{src_file}"]
+    elif os.path.isdir(os.path.join(golden, ".git")):
+        git_show_cmd = ["git", "-C", golden, "show", f"{commit_before}:{src_file}"]
+    else:
+        git_show_cmd = None  # neither tree exists; will be reported as failure below
+
+    if not os.path.isdir(slot):
+        # First time — full rsync from golden (excluding .git and slots)
+        subprocess.run(
+            ["rsync", "-a", "--exclude=.git", "--exclude=__s*", "--exclude=*.lock",
+             golden + "/", slot + "/"],
+            check=True, timeout=600
+        )
+        # Fix cmake absolute paths: golden → slot
+        _fixup_cmake_paths(golden, slot, sha)
+        # Restore buggy src_file via the chosen git source BEFORE init,
+        # so the baseline commit captures the buggy state.
+        if src_file and commit_before and git_show_cmd is not None:
+            r = subprocess.run(
+                git_show_cmd,
+                capture_output=True, timeout=60
+            )
+            if r.returncode == 0:
+                dst = os.path.join(slot, src_file)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, 'wb') as f:
+                    f.write(r.stdout)
+        # Now init the slot's own git tree with baseline-buggy commit.
+        _init_slot_git(slot)
+    else:
+        # Slot exists — just restore the src_file to buggy state
+        if src_file and commit_before and git_show_cmd is not None:
+            r = subprocess.run(
+                git_show_cmd,
+                capture_output=True, timeout=60
+            )
+            if r.returncode == 0:
+                dst = os.path.join(slot, src_file)
+                with open(dst, 'wb') as f:
+                    f.write(r.stdout)
+    # Touch src files to invalidate build cache
+    if src_file:
+        fp = os.path.join(slot, src_file)
+        if os.path.isfile(fp):
+            os.utime(fp, None)
+
+def create_pool_slots(project, sha):
+    """Pre-create pool slots during warmup. Called after reproduce completes."""
+    golden = os.path.join(ROOT_DIR, project, f"git_repo_dir_{sha}")
+    if not os.path.isdir(golden):
+        print(f"[create_pool_slots] golden not found: {golden}", file=sys.stderr)
+        return
+    for i in range(POOL_SIZE):
+        slot = _slot_dir(golden, i)
+        if os.path.isdir(slot):
+            print(f"[create_pool_slots] slot already exists: {slot}", file=sys.stderr)
+            continue
+        print(f"[create_pool_slots] creating slot {i}: {slot}", file=sys.stderr)
+        subprocess.run(
+            ["rsync", "-a", "--exclude=.git", "--exclude=__s*", "--exclude=*.lock",
+             golden + "/", slot + "/"],
+            check=True, timeout=600
+        )
+        _fixup_cmake_paths(golden, slot, sha)
+        # Give the slot its own baseline-buggy git tree so the agent can run
+        # git add/commit/diff without seeing oracle history.
+        _init_slot_git(slot)
+    print(f"[create_pool_slots] done {project}@{sha}: {POOL_SIZE} slots", file=sys.stderr)
+
+
+# Global registry of active slot locks
+_active_locks = {}
+
+
 class BugsInfo:
-    def __init__(self, project, sha):
+    def __init__(self, project, sha, work_dir=None):
         self.sha = sha
         self.project = project
         self.version, self.src_project_dir = detect_version(project)
         self.src_project = os.path.join(self.src_project_dir, project)
 
-        self.wrk_git = os.path.join(ROOT_DIR, project, f"git_repo_dir_{self.sha}")
-        self._git_tree = os.path.join(ROOT_DIR, project, f"git_repo_dir_{self.sha}_gittree/.git")
+        self.golden_dir = os.path.join(ROOT_DIR, project, f"git_repo_dir_{self.sha}")
+        # work_dir overrides the effective working directory (for pool slots)
+        self.wrk_git = work_dir if work_dir else self.golden_dir
 
         if self.version == "v0":
-            if not os.path.isdir(self.wrk_git):
-                self.wrk_git = os.path.join(ROOT_DIR, project, "git_repo_dir")
+            if not os.path.isdir(self.golden_dir):
+                self.golden_dir = os.path.join(ROOT_DIR, project, "git_repo_dir")
+                self.wrk_git = work_dir if work_dir else self.golden_dir
         else:
-            assert os.path.isdir(self.wrk_git), \
-                f"v1 repo dir must exist: {self.wrk_git}. Run warmup first."
+            assert os.path.isdir(self.golden_dir), \
+                f"v1 repo dir must exist: {self.golden_dir}. Run warmup first."
 
         self.wrk_log = os.path.join(ROOT_DIR, project, "logs")
         self.wrk_log_fn = os.path.join(ROOT_DIR, project, "logs", f"{self.sha}.log")
@@ -161,17 +436,12 @@ class BugsInfo:
         defect_compile = {x: y for x, y in defect_compile.items() if y is not None and len(y) > 0}
         self.meta_info.update({**self.meta_project, **system_compile, **defect_compile, **compile_kwargs})
         self.meta_info.update({
-            "build_dir":  f"build_{sha}",
-            "test_log":   os.path.join(self.wrk_log, f"test_{sha}_fix.log"),
-            "test_files": jmespath.search("files.test", self.meta_defect),
-            "src_file":   jmespath.search("files.src[0]", self.meta_defect),
+            "build_dir":   f"build_{sha}",
+            "test_log":    os.path.join(self.wrk_log, f"test_{sha}_fix.log"),
+            "test_files":  jmespath.search("files.test", self.meta_defect),
+            "src_file":    jmespath.search("files.src[0]", self.meta_defect),
+            "gittree_dir": _gittree_dir(self.project, sha),
         })
-
-    def git_prefix(self):
-        """Return git command prefix with --git-dir and --work-tree."""
-        if os.path.isdir(self._git_tree):
-            return f"git --git-dir={self._git_tree} --work-tree={self.wrk_git}"
-        return "git"
 
     def _build_tpl(self, tpl_path, dict_info, save_path):
         loader_dir = self.src_project
@@ -204,11 +474,12 @@ class BugsInfo:
         if self.version == "v0":
             return os.path.join(SRC_DIR, "projects", "workflow_cmake_compile_test_tpl.jinja")
         return os.path.join(SRC_DIR, "projects_v1", "workflow_cmake_compile_test_tpl.jinja")
+
     def set_reproduce_build(self):
-        rebuild_info = {"is_rebuild": True, "_git_tree": self._git_tree,
+        rebuild_info = {"is_rebuild": True,
                         "test_log": os.path.join(self.wrk_log, f"test_{self.sha}_fix.log"),
                         **self.meta_info}
-        reproduce_info = {**self.meta_info, "_git_tree": self._git_tree}
+        reproduce_info = {**self.meta_info}
         self._build_tpl(self._build_tpl_path(), self.meta_info,
                         os.path.join(self.wrk_git, "inplace_build.sh"))
         self._build_tpl(self._build_tpl_path(), rebuild_info,
@@ -221,7 +492,7 @@ class BugsInfo:
     def set_puretest_build(self):
         """Render inplace_rebuild.sh + inplace_test.sh + run_puretest.sh for trigger test."""
         rebuild_info = {"is_rebuild": True, **self.meta_info}
-        puretest_info = {**self.meta_info, "_git_tree": self._git_tree}
+        puretest_info = {**self.meta_info}
         self._build_tpl(self._build_tpl_path(), rebuild_info,
                         os.path.join(self.wrk_git, "inplace_rebuild.sh"))
         self._build_tpl(self._test_tpl_path(), self.meta_info,
@@ -233,7 +504,7 @@ class BugsInfo:
     def set_patch_build(self):
         rebuild_info = {"is_rebuild": True, **self.meta_info,
                         "test_log": os.path.join(self.wrk_log, f"test_{self.sha}_fix.log")}
-        patch_info = {**self.meta_info, "_git_tree": self._git_tree,
+        patch_info = {**self.meta_info,
                       "test_log": os.path.join(self.wrk_log, f"patch_{self.sha}_fix.log")}
         self._build_tpl(self._build_tpl_path(), rebuild_info,
                         os.path.join(self.wrk_git, "inplace_rebuild.sh"))
@@ -299,10 +570,10 @@ def cmd_reproduce_soft(bug_id):
     with open(instance.wrk_log_fn, "w") as log_f:
         instance.set_reproduce_build()
         try:
-            timeout = 3600 if "llvm" in project else 1800
+            timeout = 3600 if ("llvm" in project or "njs" in project or "nginx" in project or "SPIRV" in project or "arrow" in project or "rocksdb" in project or "uncrustify" in project) else 1800
             print(f"[cmd_reproduce] EXEC: bash run_reproduce.sh (timeout={timeout}s)", file=sys.stderr)
-            exec_cmd({"cmd": "bash run_reproduce.sh", "cwd": instance.wrk_git,
-                       "stdout": log_f, "stderr": log_f, "timeout": timeout})
+            _run_with_pgkill("bash run_reproduce.sh", cwd=instance.wrk_git,
+                       stdout=log_f, stderr=log_f, timeout=timeout)
         except subprocess.TimeoutExpired:
             print(f"[cmd_reproduce] TIMEOUT bug_id={bug_id}", file=sys.stderr)
     print(f"[cmd_reproduce] DONE bug_id={bug_id} log={instance.wrk_log_fn}", file=sys.stderr)
@@ -314,14 +585,14 @@ def cmd_reproduce(bug_id):
     instance = BugsInfo(project=project, sha=sha)
     print(f"[cmd_reproduce] START bug_id={bug_id} cwd={instance.wrk_git}", file=sys.stderr)
     with open(instance.wrk_log_fn, "w") as log_f:
-        exec_cmd({"cmd": f"{instance.git_prefix()} clean -dfx",
+        exec_cmd({"cmd": f"git -C {instance.wrk_git} clean -dfx",
                    "cwd": instance.wrk_git, "stdout": log_f, "stderr": log_f})
         instance.set_reproduce_build()
         try:
-            timeout = 3600 if "llvm" in project else 1800
+            timeout = 3600 if ("llvm" in project or "njs" in project or "nginx" in project or "SPIRV" in project or "arrow" in project or "rocksdb" in project or "uncrustify" in project) else 1800
             print(f"[cmd_reproduce] EXEC: bash run_reproduce.sh (timeout={timeout}s)", file=sys.stderr)
-            exec_cmd({"cmd": "bash run_reproduce.sh", "cwd": instance.wrk_git,
-                       "stdout": log_f, "stderr": log_f, "timeout": timeout})
+            _run_with_pgkill("bash run_reproduce.sh", cwd=instance.wrk_git,
+                       stdout=log_f, stderr=log_f, timeout=timeout)
         except subprocess.TimeoutExpired:
             print(f"[cmd_reproduce] TIMEOUT bug_id={bug_id}", file=sys.stderr)
     print(f"[cmd_reproduce] DONE bug_id={bug_id} log={instance.wrk_log_fn}", file=sys.stderr)
@@ -338,79 +609,59 @@ def cmd_fix(bug_id, patch_path):
     with open(instance.wrk_log_fn, "a") as log_f:
         try:
             print(f"[cmd_fix] EXEC: bash run_patch.sh {patch_path}", file=sys.stderr)
-            exec_cmd({"cmd": f"bash run_patch.sh {patch_path}", "cwd": instance.wrk_git,
-                       "stdout": log_f, "stderr": log_f, "timeout": 1800})
+            _run_with_pgkill(f"bash run_patch.sh {patch_path}", cwd=instance.wrk_git,
+                       stdout=log_f, stderr=log_f, timeout=1800)
         except subprocess.TimeoutExpired:
             print(f"[cmd_fix] TIMEOUT bug_id={bug_id}", file=sys.stderr)
     print(f"[cmd_fix] DONE bug_id={bug_id} log={instance.wrk_log_fn}", file=sys.stderr)
     return {"returncode": 0, "log_file": instance.wrk_log_fn}
 
 
-def cmd_checkout(bug_id):
-    """Checkout buggy source: git checkout -f <commit_before> -- <src_file>."""
+def cmd_checkout(bug_id, work_dir=None):
+    """Acquire a pool slot and restore buggy source. Returns dict with slot_path."""
     try:
         project, sha = parse_bug_id(bug_id)
-        instance = BugsInfo(project=project, sha=sha)
     except Exception as exc:
-        return {"returncode": 1, "stdout": "", "stderr": str(exc)}
-    gp = instance.git_prefix()
-    src_file = instance.meta_info.get("src_file", "")
-    commit_before = instance.meta_defect.get("commit_before", "")
+        return {"returncode": 1, "stdout": "", "stderr": str(exc), "slot_path": ""}
 
-    has_git = os.path.isdir(os.path.join(instance.wrk_git, ".git")) or os.path.isdir(instance._git_tree)
-    if not has_git:
-        print(f"ERROR: no .git in {instance.wrk_git}. Run warmup first.", file=sys.stderr)
-        return {"returncode": 1, "stdout": "", "stderr": f"no .git in {instance.wrk_git}"}
+    try:
+        slot_path, lock_fd = acquire_slot(project, sha)
+    except RuntimeError as exc:
+        return {"returncode": 1, "stdout": "", "stderr": str(exc), "slot_path": ""}
 
-    r = subprocess.run(f"{gp} cat-file -t {commit_before}", shell=True,
-                       cwd=instance.wrk_git, capture_output=True, encoding="utf-8")
-    if r.returncode != 0:
-        r2 = subprocess.run(f"{gp} rev-parse {sha}~1", shell=True,
-                            cwd=instance.wrk_git, capture_output=True, encoding="utf-8")
-        if r2.returncode == 0 and r2.stdout.strip():
-            commit_before = r2.stdout.strip()
-        else:
-            return {"returncode": 1, "stdout": "",
-                    "stderr": f"commit_before unreachable for {sha[:12]}"}
-
-    cmd = f"{gp} checkout -f {commit_before} -- {src_file}" if src_file else f"{gp} checkout -f {commit_before}"
-    r = subprocess.run(cmd, shell=True, cwd=instance.wrk_git,
-                       capture_output=True, encoding="utf-8")
-    if r.returncode != 0:
-        return {"returncode": r.returncode, "stdout": "", "stderr": r.stderr}
-
-    # IMPORTANT: `git checkout -f` restores the file with its stored mtime,
-    # which may be older than the last build artifact. ninja would then
-    # report "no work to do" and the stale (fix-state) binary would be tested.
-    # Touch all src files (and any other files listed in meta) so ninja sees
-    # them as modified and rebuilds the affected object files.
-    files_to_touch = []
-    meta_files = instance.meta_info.get("files") or {}
-    for key in ("src", "headers", "source"):
-        vals = meta_files.get(key) or []
-        if isinstance(vals, str):
-            vals = [vals]
-        files_to_touch.extend(vals)
-    if src_file and src_file not in files_to_touch:
-        files_to_touch.append(src_file)
-    for f in files_to_touch:
-        fp = os.path.join(instance.wrk_git, f)
-        if os.path.isfile(fp):
-            try:
-                os.utime(fp, None)
-            except OSError:
-                pass
+    # Store the lock_fd globally so release_slot can be called later
+    _active_locks[f"{project}@{sha}@{slot_path}"] = lock_fd
 
     return {"returncode": 0,
-            "stdout": f"Checked out buggy source: {src_file}\n  commit_before={commit_before[:12]}\n",
-            "stderr": ""}
+            "stdout": f"Checked out buggy source in slot: {slot_path}\n",
+            "stderr": "",
+            "slot_path": slot_path}
 
 
-def cmd_compile(bug_id):
+def cmd_release_slot(bug_id, slot_path):
+    """Release a previously acquired pool slot."""
+    key = f"{bug_id}@{slot_path}"
+    # Try exact key first
+    fd = _active_locks.pop(key, None)
+    if fd is None:
+        # Try with parsed bug_id
+        try:
+            project, sha = parse_bug_id(bug_id)
+            key2 = f"{project}@{sha}@{slot_path}"
+            fd = _active_locks.pop(key2, None)
+        except Exception:
+            pass
+    if fd:
+        release_slot(fd)
+        return {"returncode": 0, "stdout": "Slot released\n", "stderr": ""}
+    return {"returncode": 0, "stdout": "No active lock found (already released?)\n", "stderr": ""}
+
+
+def cmd_compile(bug_id, work_dir=None):
     """Check build_dir exists. Warmup already compiled."""
     try:
         project, sha = parse_bug_id(bug_id)
-        instance = BugsInfo(project=project, sha=sha)
+        instance = BugsInfo(project=project, sha=sha, work_dir=work_dir)
     except Exception as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc)}
     build_dir_path = os.path.join(instance.wrk_git, f"build_{sha}")
@@ -421,7 +672,7 @@ def cmd_compile(bug_id):
 
 
 
-def cmd_puretest(bug_id):
+def cmd_puretest(bug_id, work_dir=None):
     """Pure rebuild + test. Does NOT touch src_file — it's already in place.
 
     Call cmd_checkout first to restore buggy, or cmd_fix to apply a patch.
@@ -432,7 +683,7 @@ def cmd_puretest(bug_id):
     """
     try:
         project, sha = parse_bug_id(bug_id)
-        instance = BugsInfo(project=project, sha=sha)
+        instance = BugsInfo(project=project, sha=sha, work_dir=work_dir)
     except Exception as exc:
         print(f"[cmd_puretest] ERROR parsing bug_id={bug_id}: {exc}", file=sys.stderr)
         return {"returncode": 1, "passed": False, "log_file": "",
@@ -447,26 +698,26 @@ def cmd_puretest(bug_id):
 
     rc = 1
     stderr_text = ""
+    # Large cmake projects (SPIRV-Tools) may need a full rebuild in pool slots
+    puretest_timeout = 3600 if "SPIRV" in project or "llvm" in project or "arrow" in project or "rocksdb" in project else 1800
     with open(wrapper_log, "w") as log_f:
         try:
-            r = subprocess.run(
-                shlex.split("bash run_puretest.sh"),
+            proc = _run_with_pgkill(
+                "bash run_puretest.sh",
                 cwd=instance.wrk_git,
-                stdout=log_f, stderr=subprocess.STDOUT,
-                encoding="utf-8", errors="replace",
-                timeout=1800,
+                stdout=log_f, stderr=log_f,
+                timeout=puretest_timeout,
             )
-            rc = r.returncode
+            rc = proc.returncode
         except subprocess.TimeoutExpired:
             print(f"[cmd_puretest] TIMEOUT bug_id={bug_id}", file=sys.stderr)
-            stderr_text = "Timeout after 1800s"
+            stderr_text = f"Timeout after {puretest_timeout}s"
 
     print(f"[cmd_puretest] DONE bug_id={bug_id} rc={rc} wrapper_log={wrapper_log}", file=sys.stderr)
 
     # ── Find the REAL test log/status/msg files ──
     # inplace_test.sh writes: test_{sha}_{md5}.log / .status / .msg
     # where md5 is the MD5 of the src_file content.
-    import glob as _glob
     import hashlib as _hashlib
 
     test_log_file = ""
@@ -516,6 +767,14 @@ def cmd_puretest(bug_id):
         pass
 
     passed = "success" in status_text.lower()
+    # Override: if returncode indicates a crash signal (e.g., SIGSEGV=139, SIGABRT=134),
+    # treat as FAIL even if the status file says "success" (the test script may not
+    # have captured the shell's crash message in the test_log file).
+    if rc and rc > 128:
+        # 255 is a generic shell error, not necessarily a signal
+        if rc != 255:
+            passed = False
+            status_text = "FAILED"
 
     return {
         "returncode": rc,
@@ -565,6 +824,9 @@ if __name__ == "__main__":
     fix_parser = subparsers.add_parser("fix")
     fix_parser.add_argument("bug_id")
     fix_parser.add_argument("patch_path")
+    release_parser = subparsers.add_parser("release_slot")
+    release_parser.add_argument("bug_id")
+    release_parser.add_argument("slot_path")
     args = parser.parse_args()
     if not args.command:
         parser.print_help(); sys.exit(1)
@@ -576,4 +838,4 @@ if __name__ == "__main__":
     elif args.command == "compile": cmd_compile(args.bug_id)
     elif args.command == "test": cmd_puretest(args.bug_id)
     elif args.command == "info": cmd_info(args.bug_id)
-
+    elif args.command == "release_slot": cmd_release_slot(args.bug_id, args.slot_path)

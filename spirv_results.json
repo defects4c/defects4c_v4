@@ -1,0 +1,57 @@
+[
+ {
+  "sha": "0a43a84e02245cca40ce187d1e427a5d0b4f3d13",
+  "fix": "ERR",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "0a5d99d02cb8c0edd41c7a9d4f309c0974d076d0",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "0ad83f9139daf70a791560f5c72f94b0be5b8390",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "286b3095dd187da747f85baf9ce3120580565df0",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "4fa1a6f9b497193e54a814112f17ab3c2cf58053",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "54385458ca2f7a7b06699e441822753dbc2d018d",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "6a9be627c760cf1efa43d155d4e6ee5e801deba3",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "948577c5df3a6f0d337ab417b26edcc344eb65e2",
+  "fix": "ERR",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "ab3cdcaef56e9311f299eebfd044f9646100c9dc",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "d5a3bfcf2ffd154a244e7ffae54dd1766d98efa4",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ },
+ {
+  "sha": "0391d0823ebf...",
+  "fix": "PASS",
+  "buggy": "FAIL"
+ }
+]

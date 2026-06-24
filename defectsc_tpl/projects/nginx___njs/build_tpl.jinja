@@ -1,18 +1,26 @@
-
 {% if not is_rebuild %}
 	{{apt_install_fn}}
 	#apt_install_fn gdb
 
 	set -e  
-	( ./configure {% for option in build_flags %}{{ option }} {% endfor %}  --build-dir={{build_dir}} )|| (  ./configure {% for option in build_flags %}{{ option }} {% endfor %}   )
+	( CC="gcc" CXX="g++" ./configure {% for option in build_flags %}{{ option }} {% endfor %}  --build-dir={{build_dir}} )|| ( CC="gcc" CXX="g++" ./configure {% for option in build_flags %}{{ option }} {% endfor %}   )
 	set +e 
 	
-	
+{% endif %}
+
+{% if is_rebuild %}
+# On rebuild path, re-run configure if build Makefile is missing (e.g. after slot wipe)
+if [ ! -f {{build_dir}}/Makefile ]; then
+    echo "[rebuild] build Makefile missing -- re-running configure..."
+    # Fallback for old njs versions that do not support --build-dir (e.g. CVE-2021-46461):
+    # if --build-dir is rejected, configure into the default ./build dir instead.
+    ( CC="gcc" CXX="g++" ./configure {% for option in build_flags %}{{ option }} {% endfor %} --build-dir={{build_dir}} ) || ( CC="gcc" CXX="g++" ./configure {% for option in build_flags %}{{ option }} {% endfor %} )
+fi
 {% endif %}
 
 #CFLAGS="-fsanitize=address -g -Wno-error "
 
-make -j {{ cpu_count }}  CFLAGS="-fsanitize=address -g -Wno-error " 
+make -j {{ cpu_count }}     NJS_CFLAGS="-pipe -fPIC -fvisibility=hidden -O -W -Wall -Wextra -Wno-unused-parameter -Wwrite-strings -Wmissing-prototypes -Werror -g -O -fsanitize=address -fno-omit-frame-pointer"     NJS_LINK="gcc -fsanitize=address"     CFLAGS="-fsanitize=address -g -Wno-error"     LDFLAGS="-fsanitize=address"
 # CFLAGS=" -g -O0 "
 
 #make -j {{ cpu_count }} install     CFLAGS=" -g -O0 "

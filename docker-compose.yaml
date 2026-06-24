@@ -15,5 +15,10 @@ services:
       - D4C_PORT=11111
       - D4C_TIMEOUT=1800
       - PATCH_OUTPUT_DIR=/patches
-      - D4C_WORKERS=4
+      - D4C_WORKERS=8
+    deploy:
+      resources:
+        limits:
+          cpus: "${D4C_CPU_LIMIT:-32}"
+          memory: "${D4C_MEM_LIMIT:-96g}"
     restart: unless-stopped

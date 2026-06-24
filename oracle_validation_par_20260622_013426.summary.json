@@ -1,0 +1,15 @@
+{
+  "total_bugs": 216,
+  "counts": {
+    "passed_both": 47,
+    "fix_only": 17,
+    "buggy_only": 7,
+    "neither": 0,
+    "errored": 145,
+    "unwarmed": 0
+  },
+  "passed_both_pct": 21.8,
+  "out_csv": "oracle_validation_par_20260622_013426.csv",
+  "completed_at": "2026-06-22 02:27:22",
+  "wallclock_s": 3175.7
+}

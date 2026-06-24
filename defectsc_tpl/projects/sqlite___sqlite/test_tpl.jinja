@@ -4,7 +4,12 @@ TIMEOUT=10
 cat /dev/null > $test_log
 
 
-timeout 100  make -j {{ cpu_count }}  testfixture 
+# Build testfixture with SQLITE_DEBUG so memory-safety regressions (e.g.
+# CVE-2019-20218 use-after-free in the WITH-stack unwind) trip an assert()
+# and abort. Under the default -DNDEBUG build the buggy code reads stale-but-
+# mapped memory and silently returns the expected result, making fix and buggy
+# indistinguishable. sqliteInt.h auto-undefines NDEBUG when SQLITE_DEBUG is set.
+timeout 600  make -j {{ cpu_count }}  testfixture OPTS="-DSQLITE_DEBUG=1"
 
 
 

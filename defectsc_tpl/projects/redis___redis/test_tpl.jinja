@@ -4,7 +4,19 @@ test_log=$2
 
 
 
-./runtest --single   {{test_flags|join(" ") }} > $test_log 2>&1 
+# The redis tcl test harness binds a Unix domain socket whose absolute path is
+# [file normalize ./tests/tmp/server.<pid>.<n>/socket]. In the pool-slot layout
+# the slot prefix (/out/<proj>/git_repo_dir_<40-char-sha>/__sN/...) already
+# exceeds the sun_path 108-char limit, so the test server fails with
+# "unix socket path too long". `file normalize` resolves symlinks, so point
+# tests/tmp at a short directory under /tmp; the normalized socket path then
+# becomes /tmp/rds_<pid>/server.../socket which is well under 108 chars.
+rm -rf tests/tmp
+short_tmp="/tmp/rds_$$"
+rm -rf "$short_tmp"
+mkdir -p "$short_tmp"
+ln -sfn "$short_tmp" tests/tmp
+./runtest --single   {{test_flags|join(" ") }} > $test_log 2>&1
 
 
 
@@ -12,7 +24,7 @@ test_log=$2
 get_status() {
 	string=$(cat $test_log )
 	
-    if [[ $string == *"The following tests failed"* ]] || [[ $string == *"==ERROR"* ]] || [[ $string == *"FAILED"* ]] || [[ $string == *"AddressSanitizer:"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] ; then	    
+    if [[ $string == *"The following tests failed"* ]] || [[ $string == *"==ERROR"* ]] || [[ $string == *"FAILED"* ]] || [[ $string == *"AddressSanitizer:"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] || [[ $string == *"Segmentation fault"* ]] || [[ $string == *"core dumped"* ]] || [[ $string == *"[exception]:"* ]] || [[ $string == *"\[err\]"* ]] ; then	    
     	echo "FAILED\n"
 	else
 	    echo "success\n"
@@ -36,5 +48,4 @@ status_log=$( get_status)
 echo $status_log > "${fix_log}.status"
 
 get_err_msg  "${fix_log}.msg" 
-
 

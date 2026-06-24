@@ -14,11 +14,16 @@ if [ ! -f cve_2021_46461_poc.js ]; then
  cp /src/projects/nginx___njs/cve_2021_46461_poc.js  ./cve_2021_46461_poc.js 
 fi 
 # Test CVE-2021-46461 POC
-$build_dir/njs cve_2021_46461_poc.js >>  $test_log 2>&1 
+# Bounded: buggy njs may loop on SIGSEGV (ASAN DEADLYSIGNAL) and spew GBs.
+ASAN_OPTIONS="halt_on_error=1:detect_leaks=0" timeout 120 $build_dir/njs cve_2021_46461_poc.js 2>&1 | head -c 4000000 >> $test_log
+poc_rc=${PIPESTATUS[0]}
+if [ $poc_rc -eq 124 ]; then echo "NJS_POC_TIMEOUT rc=124" >> $test_log; fi
+if [ $poc_rc -gt 128 ] && [ $poc_rc -ne 141 ]; then echo "NJS_POC_SIGNAL rc=$poc_rc" >> $test_log; fi
+if [ $poc_rc -eq 141 ]; then echo "NJS_POC_SIGPIPE rc=141" >> $test_log; fi
 
 get_status() {
         string=$(cat $fn)
-        if [[ $string == *"==ERROR"* ]] || [[ $string == *"AddressSanitizer"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] ; then        
+        if [[ $string == *"==ERROR"* ]] || [[ $string == *"AddressSanitizer"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] || [[ $string == *"NJS_POC_TIMEOUT"* ]] || [[ $string == *"NJS_POC_SIGNAL"* ]] || [[ $string == *"NJS_POC_SIGPIPE"* ]] ; then        
             echo "FAILED"
         else
             echo "success"

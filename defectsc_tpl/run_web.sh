@@ -7,8 +7,12 @@ fi
 
 
 
+: "${D4C_WORKERS:=$(( $(nproc 2>/dev/null || echo 4) / 4 ))}"
+[ "$D4C_WORKERS" -lt 2 ] && D4C_WORKERS=2
+echo "Starting gunicorn with $D4C_WORKERS workers (nproc=$(nproc 2>/dev/null || echo unknown))"
+
 exec gunicorn -k uvicorn.workers.UvicornWorker \
-    --workers "${D4C_WORKERS:-4}" \
+    --workers "$D4C_WORKERS" \
     --bind "0.0.0.0:${D4C_PORT:-11111}" \
     --timeout 600 \
     --graceful-timeout 120 \

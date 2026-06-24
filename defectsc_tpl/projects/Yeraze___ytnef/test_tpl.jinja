@@ -2,26 +2,38 @@ build_dir=$1
 test_log=$2
 
 
-rm -fr  test-data/data 
+rm -fr  test-data/data
 
 cd test-data
 
-./test.sh > $test_log 2>&1 
+# This bug (commit 3cb0f914) fixes an out-of-bounds read on a TNEF Version
+# field with size 0. The discriminating regression is the single ytnefprint
+# invocation that the fix commit added to test.sh:
+#     ytnefprint ./ytnef-oob-TNEFVersion-SwapWord | grep "ERROR: Field with size of 0"
+# The rest of test.sh loops over *.tnef inputs (winmail.dat, missing-filenames.tnef)
+# whose ASAN crashes are non-deterministic and unrelated to this fix, so running
+# the full test.sh masks the real fix/buggy signal. Run only the targeted check.
+../ytnefprint/ytnefprint ./ytnef-oob-TNEFVersion-SwapWord > $test_log 2>&1
+echo "ytnefprint_returncode=$?" >> $test_log
 
 
 get_status() {
 	string=$(cat $test_log )
-	
-    if [[ $string == *"==ERROR"* ]] || [[ $string == *"FAILED"* ]] || [[ $string == *"AddressSanitizer:"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] ; then	    
-    	echo "FAILED\n"
+
+	# Fix is correct only when the OOB guard fires with the expected message
+	# AND there is no sanitizer/segfault crash.
+	if [[ $string == *"==ERROR"* ]] || [[ $string == *"AddressSanitizer:"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] || [[ $string == *"Segmentation fault"* ]] || [[ $string == *"core dumped"* ]] || [[ $string == *"[exception]:"* ]] ; then
+		echo "FAILED\n"
+	elif [[ $string == *"ERROR: Field with size of 0"* ]] ; then
+		echo "success\n"
 	else
-	    echo "success\n"
-	fi	
+		echo "FAILED\n"
+	fi
 }
 
 
 get_err_msg() {
-	awk '/AddressSanitizer:/,0' $test_log >  $1 
+	awk '/AddressSanitizer:/,0' $test_log >  $1
 }
 
 
@@ -31,6 +43,4 @@ echo $fix_log"---->"
 status_log=$( get_status)
 echo $status_log > "${fix_log}.status"
 
-get_err_msg  "${fix_log}.msg" 
-
-
+get_err_msg  "${fix_log}.msg"

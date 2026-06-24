@@ -1,5 +1,3 @@
-
-
 {% if not is_rebuild %}
 
 	{{apt_install_fn}}
@@ -16,6 +14,20 @@
 
 {% endif %}
 
+# Slot-rebuild fallback: in rebuild/puretest mode the configure block above is
+# skipped, but some slots never had a successful full build and therefore have
+# no Makefile (only ./configure + main.mk). Running 'make' then dies with
+# "No targets specified and no makefile found". Regenerate the Makefile here if
+# it is missing so rebuild works from a clean slot.
+if [ ! -f Makefile ]; then
+	apt_install_fn tclsh 2>/dev/null || true
+	apt_install_fn tclx8.4-dev 2>/dev/null || true
+	apt_install_fn gdb 2>/dev/null || true
+	./configure {% for option in build_flags %}{{ option }} {% endfor %}  \
+	--prefix=`pwd`/{{build_dir}} \
+	CFLAGS="-Wno-error" \
+	CPPFLAGS="-Wno-error"
+fi
 
 
 make -j {{ cpu_count }}
