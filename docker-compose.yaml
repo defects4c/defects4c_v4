@@ -16,6 +16,34 @@ services:
       - D4C_TIMEOUT=1800
       - PATCH_OUTPUT_DIR=/patches
       - D4C_WORKERS=8
+      # gunicorn worker timeout — MUST exceed the longest in-handler build+test
+      # (bug_helper caps at 1800-3600s). run_web.sh hardcodes 600 which killed
+      # slow oracle builds mid-flight; the command override below uses this.
+      - D4C_GUNICORN_TIMEOUT=4000
+    # Override the image CMD (bash /src/run_web.sh, which hardcodes --timeout 600
+    # and --reload). Same flags, but a build-safe timeout and no --reload so a
+    # long validation batch is never disrupted by a mid-run worker restart.
+    # NOTE: $$ escapes docker-compose interpolation so the CONTAINER shell
+    # resolves these (D4C_PORT=11111 inside the container). A single $ would let
+    # compose substitute from .env (D4C_PORT=8095) and bind the wrong port.
+    command:
+      - bash
+      - -c
+      - |
+        cd /src
+        if [ -d /src/.venv ]; then source /src/.venv/bin/activate; fi
+        exec gunicorn -k uvicorn.workers.UvicornWorker \
+          --workers "$${D4C_WORKERS:-8}" \
+          --bind "0.0.0.0:$${D4C_PORT:-11111}" \
+          --timeout "$${D4C_GUNICORN_TIMEOUT:-4000}" \
+          --graceful-timeout 120 \
+          --keep-alive 5 \
+          --backlog 2048 \
+          --worker-tmp-dir /tmp \
+          --access-logfile /out/access.log \
+          --error-logfile /out/error.log \
+          --capture-output \
+          webapp:app
     deploy:
       resources:
         limits:

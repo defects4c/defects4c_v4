@@ -6,7 +6,7 @@ All build/test logic lives here. webapp.py wraps these as HTTP endpoints.
 Commands:
   reproduce  <bug_id>               Full reproduce (warmup, run ONCE)
   fix        <bug_id> <patch_path>  Copy patch → src_file, rebuild, test
-  checkout   <bug_id>               Acquire pool slot, restore buggy src_file
+  checkout   <bug_id>               Acquire pool slot, FULL-reset it to buggy baseline
   compile    <bug_id>               Check build_dir exists (warmup already built)
   test       <bug_id>               Pure rebuild + test (src_file already edited)
   info       <bug_id>               Print bug metadata
@@ -16,10 +16,13 @@ bug_id format: project@sha  (short sha supported)
 
 Architecture (workspace pool):
   warmup (reproduce) runs ONCE on the golden directory.
-  After warmup, create_pool_slots() pre-creates __s0/__s1/__s2 via rsync.
-  The flow is always:
+  After warmup, create_pool_slots() builds ONE pristine per-bug backup (buggy
+  worktree + pre-built build_<sha>/ + baseline_buggy git) and provisions
+  __s0/__s1/__s2 from it. The flow is always:
     checkout (acquire slot) → edit src_file → test (rebuild+run) → release_slot
-  - cmd_checkout: acquires a pool slot, restores buggy src from golden's git
+  - cmd_checkout: acquires a pool slot and FULLY resets it to the buggy baseline
+      by rsyncing the whole backup (worktree + git tree) over it with --delete,
+      so no leftover from a previous holder can leak into the next verdict.
   - cmd_fix: copies patch file into src, then rebuild+test
   - cmd_puretest: just rebuild+test (src already in place, do NOT touch it)
   - cmd_release_slot: releases the pool slot lock
@@ -29,8 +32,10 @@ import sys
 import os
 import json
 import shlex
+import shutil
 import subprocess
 import fcntl
+import time
 from os.path import join as opj
 
 import signal
@@ -177,43 +182,121 @@ def _lock_path(golden_dir, slot_idx):
     """Return path to slot lock file."""
     return os.path.join(golden_dir, f"__s{slot_idx}.lock")
 
+# Ownership of a pool slot is recorded as JSON *content* inside __s{i}.lock
+# (an "owner file"), NOT as a POSIX flock held open across HTTP requests. The
+# old scheme kept the flock fd in a per-worker dict and relied on the *release*
+# request landing on the same gunicorn worker that served *checkout*; when it
+# didn't (7 of 8 times) the fd leaked and pinned the slot for the worker's whole
+# life. With an owner file, release just empties the file and can run on ANY
+# worker, so the slot can never be leaked by a cross-worker handoff.
+#
+# SLOT_TTL is only a backstop for a client that crashes without releasing. It
+# must comfortably exceed the longest time an agent legitimately holds a slot
+# between checkout and release (AGENT_TIMEOUT is ~4200s), so a live session is
+# never reclaimed out from under itself. Normal releases are immediate.
+SLOT_TTL = 14400  # 4h
+
+def _read_owner(meta_fd):
+    """Parse the owner record from an open lock file, or None if free/garbage."""
+    try:
+        meta_fd.seek(0)
+        raw = meta_fd.read().strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None  # empty / legacy / corrupt → treat as free
+
+def _write_owner(meta_fd):
+    """Stamp this process + wall-clock time as the slot owner."""
+    meta_fd.seek(0)
+    meta_fd.truncate()
+    meta_fd.write(json.dumps({"pid": os.getpid(), "ts": time.time()}))
+    meta_fd.flush()
+    try:
+        os.fsync(meta_fd.fileno())
+    except Exception:
+        pass
+
+def _clear_owner_file(lock_file):
+    """Mark a slot free by emptying its owner record. Worker-independent: the
+    brief flock is taken and released inside this call, never held across
+    requests, so it cannot leak."""
+    try:
+        with open(lock_file, 'a+') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                f.truncate()
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        return True
+    except Exception as exc:
+        print(f"[release] clear owner failed for {lock_file}: {exc}", file=sys.stderr)
+        return False
+
 def acquire_slot(project, sha):
-    """Acquire a pool slot for the given bug. Returns (slot_path, lock_fd) or raises."""
+    """Acquire a pool slot for the given bug. Returns (slot_path, lock_handle)
+    or raises. `lock_handle` is the lock-file path (a plain string), passed back
+    to release_slot(). A brief flock is used only to make each claim atomic and
+    is released before this function returns — nothing is held across requests."""
     golden = os.path.join(ROOT_DIR, project, f"git_repo_dir_{sha}")
+    now = time.time()
     for i in range(POOL_SIZE):
         lock_file = _lock_path(golden, i)
+        claimed = False
         try:
-            fd = open(lock_file, 'w')
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Got the lock — restore slot from golden
-            slot = _slot_dir(golden, i)
-            try:
-                _restore_slot(golden, slot, project, sha)
-            except Exception as _rest_exc:
-                print(f"[acquire_slot] _restore_slot failed for slot {i}: {_rest_exc}", file=sys.stderr)
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                    fd.close()
-                except:
-                    pass
-                continue
-            return slot, fd
-        except (IOError, OSError) as _slot_exc:
-            # Slot busy or open/flock failed, try next
-            try:
-                fd.close()
-            except:
-                pass
+            meta_fd = open(lock_file, 'a+')
+        except (IOError, OSError):
             continue
+        try:
+            fcntl.flock(meta_fd, fcntl.LOCK_EX)  # brief, in-call only
+            owner = _read_owner(meta_fd)
+            busy = owner is not None and (now - float(owner.get("ts", 0) or 0)) < SLOT_TTL
+            if not busy:
+                _write_owner(meta_fd)  # claim: fresh slot or reclaim a stale one
+                claimed = True
+        finally:
+            try:
+                fcntl.flock(meta_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            meta_fd.close()
+        if not claimed:
+            continue
+        # We logically own slot i now — restore buggy source into it.
+        slot = _slot_dir(golden, i)
+        try:
+            _restore_slot(golden, slot, project, sha)
+        except Exception as _rest_exc:
+            print(f"[acquire_slot] _restore_slot failed for slot {i}: {_rest_exc}", file=sys.stderr)
+            _clear_owner_file(lock_file)  # give the claim back, try next slot
+            continue
+        return slot, lock_file
     raise RuntimeError(f"All {POOL_SIZE} pool slots busy for {project}@{sha}")
 
-def release_slot(lock_fd):
-    """Release a pool slot."""
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
-    except:
-        pass
+def release_slot(lock_handle):
+    """Release a pool slot. `lock_handle` is the lock-file path returned by
+    acquire_slot; emptying it frees the slot from any worker. A legacy raw file
+    object is still accepted for safety (unlocked + closed)."""
+    if not lock_handle:
+        return
+    if hasattr(lock_handle, "fileno"):  # back-compat: legacy fd object
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+            lock_handle.close()
+        except Exception:
+            pass
+        return
+    _clear_owner_file(lock_handle)
 
 def _fixup_cmake_paths(golden, slot, sha):
     """After rsyncing from golden to slot, fix build-system-generated absolute
@@ -283,9 +366,54 @@ def _fixup_cmake_paths(golden, slot, sha):
     print(f"[_fixup_cmake_paths] fixed {len(targets)} files in {slot}", file=sys.stderr)
 
 
-def _restore_slot(golden, slot, project, sha):
-    """Restore a slot to the buggy state by rsyncing from golden."""
-    # Find the src_file from metadata
+# ═══════════════════════════════════════════════════════════════
+#  Pristine backup (the "golden slot") + full-reset semantics
+# ═══════════════════════════════════════════════════════════════
+#
+# A slot must be a CLEAN buggy checkout every time an agent acquires it, so
+# leftovers from a previous verification (edits to files other than src_file,
+# the agent's own git commits, stray build artifacts) can never leak into the
+# next patch's verdict. Defects4J gets this for free by checking out a brand
+# new tree into a fresh tmp folder; Defects4C is git-based and reuses slots, so
+# we keep ONE pristine per-bug backup and rsync the whole thing — worktree AND
+# git tree — over the slot on every reset.
+#
+# Backup layout (sibling of golden, so it is never nested inside a slot and is
+# never matched by the `__s*` slot excludes):
+#     out/<project>/git_repo_dir_<sha>__backup/
+#         <worktree, buggy src, pre-built build_<sha>/>
+#         .git/                          # baseline_buggy, self-contained
+#         .gitignore                     # ignores build_<sha>/ + generated scripts
+# The backup is built ONCE from golden (oracle .git excluded, buggy src_file
+# restored, its own baseline git initialised). Each slot is then just
+# `rsync --delete backup/ slot/` + a cmake absolute-path fixup (backup→slot).
+
+
+def _slot_backup_dir(golden):
+    """Pristine per-bug backup dir. Sibling of golden (…_<sha>__backup)."""
+    return golden.rstrip("/") + "__backup"
+
+
+def _bug_src_file(project, sha):
+    """Return the buggy source file path (relative) for a bug, or ''."""
+    version, src_project_dir = detect_version(project)
+    src_project = os.path.join(src_project_dir, project)
+    bugs_file = os.path.join(src_project, "bugs_list_new.json")
+    if not os.path.exists(bugs_file):
+        bugs_file = os.path.join(src_project, "bugs_list.json")
+    with open(bugs_file) as f:
+        meta_bugs = json.load(f)
+    meta = jmespath.search(f"[?commit_after=='{sha}']", meta_bugs)
+    if not meta:
+        return ""
+    return jmespath.search("files.src[0]", meta[0]) or ""
+
+
+def _git_show_buggy_src(golden, project, sha):
+    """Return (src_file, buggy_content_bytes | None) for the bug.
+
+    Prefers the relocated _gittree, falls back to legacy in-place golden/.git.
+    """
     version, src_project_dir = detect_version(project)
     src_project = os.path.join(src_project_dir, project)
     bugs_file = os.path.join(src_project, "bugs_list_new.json")
@@ -299,78 +427,130 @@ def _restore_slot(golden, slot, project, sha):
     src_file = jmespath.search("files.src[0]", meta[0]) or ""
     commit_before = meta[0].get("commit_before", "")
 
-    # Pick the git source for the buggy src_file: relocated _gittree wins,
-    # legacy in-place golden/.git is the fallback for unmigrated bugs.
-    gittree = _gittree_dir(project, sha)
-    gittree_git = os.path.join(gittree, ".git")
+    gittree_git = os.path.join(_gittree_dir(project, sha), ".git")
     if os.path.isdir(gittree_git):
-        git_show_cmd = ["git", f"--git-dir={gittree_git}", "show", f"{commit_before}:{src_file}"]
+        cmd = ["git", f"--git-dir={gittree_git}", "show", f"{commit_before}:{src_file}"]
     elif os.path.isdir(os.path.join(golden, ".git")):
-        git_show_cmd = ["git", "-C", golden, "show", f"{commit_before}:{src_file}"]
+        cmd = ["git", "-C", golden, "show", f"{commit_before}:{src_file}"]
     else:
-        git_show_cmd = None  # neither tree exists; will be reported as failure below
+        cmd = None
+    content = None
+    if src_file and commit_before and cmd is not None:
+        r = subprocess.run(cmd, capture_output=True, timeout=60)
+        if r.returncode == 0:
+            content = r.stdout
+    return src_file, content
 
-    if not os.path.isdir(slot):
-        # First time — full rsync from golden (excluding .git and slots)
-        subprocess.run(
-            ["rsync", "-a", "--exclude=.git", "--exclude=__s*", "--exclude=*.lock",
-             golden + "/", slot + "/"],
-            check=True, timeout=600
-        )
-        # Fix cmake absolute paths: golden → slot
-        _fixup_cmake_paths(golden, slot, sha)
-        # Restore buggy src_file via the chosen git source BEFORE init,
-        # so the baseline commit captures the buggy state.
-        if src_file and commit_before and git_show_cmd is not None:
-            r = subprocess.run(
-                git_show_cmd,
-                capture_output=True, timeout=60
+
+def _slot_gitignore(sha):
+    """.gitignore for the baseline commit: keep build artifacts and generated
+    wrapper scripts out of git so the slot's `git status`/`git diff` reflect only
+    real source changes (the per-slot cmake path fixup rewrites build files, and
+    we do not want that to show up as a diff)."""
+    return "\n".join([
+        f"build_{sha}/",
+        "inplace_build.sh", "inplace_rebuild.sh", "inplace_test.sh",
+        "run_reproduce.sh", "run_puretest.sh", "run_patch.sh",
+        "Makefile", "libtool", "config.status", "config.log",
+    ]) + "\n"
+
+
+def _build_backup(golden, project, sha):
+    """Build (once) and return the pristine per-bug backup dir.
+
+    Idempotent and concurrency-safe: guarded by a flock; built into a temp dir
+    and atomically renamed so a half-built backup is never observable.
+    """
+    backup = _slot_backup_dir(golden)
+    if os.path.isdir(os.path.join(backup, ".git")):
+        return backup
+    lock_path = backup + ".buildlock"
+    with open(lock_path, "a+") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if os.path.isdir(os.path.join(backup, ".git")):
+                return backup
+            # Clear any stale/partial backup left by a crashed earlier attempt.
+            if os.path.isdir(backup):
+                shutil.rmtree(backup, ignore_errors=True)
+            tmp = backup + ".tmp"
+            if os.path.isdir(tmp):
+                shutil.rmtree(tmp, ignore_errors=True)
+            os.makedirs(tmp, exist_ok=True)
+            print(f"[_build_backup] building pristine backup for {project}@{sha}", file=sys.stderr)
+            # Copy golden's worktree (NOT the oracle .git, NOT nested slots).
+            subprocess.run(
+                ["rsync", "-a", "--delete", "--exclude=.git",
+                 "--exclude=__s*", "--exclude=*.lock",
+                 golden + "/", tmp + "/"],
+                check=True, timeout=1800,
             )
-            if r.returncode == 0:
-                dst = os.path.join(slot, src_file)
+            # cmake absolute paths: golden → backup.
+            _fixup_cmake_paths(golden, tmp, sha)
+            # Restore the buggy src_file so the baseline captures the buggy state.
+            src_file, content = _git_show_buggy_src(golden, project, sha)
+            if src_file and content is not None:
+                dst = os.path.join(tmp, src_file)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-                with open(dst, 'wb') as f:
-                    f.write(r.stdout)
-        # Now init the slot's own git tree with baseline-buggy commit.
-        _init_slot_git(slot)
-    else:
-        # Slot exists — just restore the src_file to buggy state
-        if src_file and commit_before and git_show_cmd is not None:
-            r = subprocess.run(
-                git_show_cmd,
-                capture_output=True, timeout=60
-            )
-            if r.returncode == 0:
-                dst = os.path.join(slot, src_file)
-                with open(dst, 'wb') as f:
-                    f.write(r.stdout)
-    # Touch src files to invalidate build cache
+                with open(dst, "wb") as f:
+                    f.write(content)
+            # Ignore build artifacts / generated scripts, then init baseline git.
+            with open(os.path.join(tmp, ".gitignore"), "w") as f:
+                f.write(_slot_gitignore(sha))
+            _init_slot_git(tmp)
+            os.rename(tmp, backup)
+            print(f"[_build_backup] done: {backup}", file=sys.stderr)
+            return backup
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _restore_from_backup(backup, slot, project, sha):
+    """Reset a slot to the pristine buggy baseline by rsyncing the whole backup
+    (worktree + .git) over it with --delete, then fixing cmake paths backup→slot.
+
+    --delete removes anything the previous holder added; syncing .git rewinds
+    the slot's own git tree to baseline_buggy. Build artifacts are reused
+    (backup carries the pre-built build_<sha>/), so this stays incremental."""
+    if not os.path.isdir(slot):
+        os.makedirs(slot, exist_ok=True)
+    # No excludes: the backup is already clean (no oracle .git, no nested slots,
+    # no lock files), and a slot never contains a nested __s* dir, so --delete
+    # scrubs EVERY leftover the previous holder created.
+    subprocess.run(
+        ["rsync", "-a", "--delete", backup + "/", slot + "/"],
+        check=True, timeout=1800,
+    )
+    _fixup_cmake_paths(backup, slot, sha)
+    # Touch src file so the rebuild picks up the (re-)restored buggy contents.
+    src_file = _bug_src_file(project, sha)
     if src_file:
         fp = os.path.join(slot, src_file)
         if os.path.isfile(fp):
             os.utime(fp, None)
 
+
+def _restore_slot(golden, slot, project, sha):
+    """Restore a slot to a CLEAN buggy state: full worktree + git-tree reset
+    from the pristine per-bug backup (built lazily on first use)."""
+    backup = _build_backup(golden, project, sha)
+    _restore_from_backup(backup, slot, project, sha)
+
 def create_pool_slots(project, sha):
-    """Pre-create pool slots during warmup. Called after reproduce completes."""
+    """Pre-create pool slots during warmup. Called after reproduce completes.
+
+    Builds the pristine per-bug backup once, then provisions every slot from it
+    (worktree + baseline git). Slots are (re)set unconditionally so warmup
+    always leaves a clean buggy baseline."""
     golden = os.path.join(ROOT_DIR, project, f"git_repo_dir_{sha}")
     if not os.path.isdir(golden):
         print(f"[create_pool_slots] golden not found: {golden}", file=sys.stderr)
         return
+    backup = _build_backup(golden, project, sha)
     for i in range(POOL_SIZE):
         slot = _slot_dir(golden, i)
-        if os.path.isdir(slot):
-            print(f"[create_pool_slots] slot already exists: {slot}", file=sys.stderr)
-            continue
-        print(f"[create_pool_slots] creating slot {i}: {slot}", file=sys.stderr)
-        subprocess.run(
-            ["rsync", "-a", "--exclude=.git", "--exclude=__s*", "--exclude=*.lock",
-             golden + "/", slot + "/"],
-            check=True, timeout=600
-        )
-        _fixup_cmake_paths(golden, slot, sha)
-        # Give the slot its own baseline-buggy git tree so the agent can run
-        # git add/commit/diff without seeing oracle history.
-        _init_slot_git(slot)
+        print(f"[create_pool_slots] provisioning slot {i} from backup: {slot}", file=sys.stderr)
+        _restore_from_backup(backup, slot, project, sha)
     print(f"[create_pool_slots] done {project}@{sha}: {POOL_SIZE} slots", file=sys.stderr)
 
 
@@ -625,12 +805,14 @@ def cmd_checkout(bug_id, work_dir=None):
         return {"returncode": 1, "stdout": "", "stderr": str(exc), "slot_path": ""}
 
     try:
-        slot_path, lock_fd = acquire_slot(project, sha)
+        slot_path, lock_handle = acquire_slot(project, sha)
     except RuntimeError as exc:
         return {"returncode": 1, "stdout": "", "stderr": str(exc), "slot_path": ""}
 
-    # Store the lock_fd globally so release_slot can be called later
-    _active_locks[f"{project}@{sha}@{slot_path}"] = lock_fd
+    # Bookkeeping only — release no longer depends on this dict (see
+    # cmd_release_slot, which clears the owner file directly from slot_path and
+    # therefore works even when the release lands on a different worker).
+    _active_locks[f"{project}@{sha}@{slot_path}"] = lock_handle
 
     return {"returncode": 0,
             "stdout": f"Checked out buggy source in slot: {slot_path}\n",
@@ -639,22 +821,25 @@ def cmd_checkout(bug_id, work_dir=None):
 
 
 def cmd_release_slot(bug_id, slot_path):
-    """Release a previously acquired pool slot."""
-    key = f"{bug_id}@{slot_path}"
-    # Try exact key first
-    fd = _active_locks.pop(key, None)
-    if fd is None:
-        # Try with parsed bug_id
-        try:
-            project, sha = parse_bug_id(bug_id)
-            key2 = f"{project}@{sha}@{slot_path}"
-            fd = _active_locks.pop(key2, None)
-        except Exception:
-            pass
-    if fd:
-        release_slot(fd)
+    """Release a previously acquired pool slot. Worker-independent: it derives
+    the lock file from slot_path and empties the owner record directly, so it
+    frees the slot even when this release request is served by a different
+    gunicorn worker than the one that ran checkout. (The old code popped a
+    per-worker dict and no-op'd on a miss — that was the fd leak.)"""
+    # Best-effort cleanup of the in-memory registry on whichever worker we are;
+    # not required for correctness.
+    _active_locks.pop(f"{bug_id}@{slot_path}", None)
+    try:
+        project, sha = parse_bug_id(bug_id)
+        _active_locks.pop(f"{project}@{sha}@{slot_path}", None)
+    except Exception:
+        pass
+
+    lock_file = slot_path.rstrip("/") + ".lock" if slot_path else ""
+    if lock_file and os.path.isfile(lock_file):
+        _clear_owner_file(lock_file)
         return {"returncode": 0, "stdout": "Slot released\n", "stderr": ""}
-    return {"returncode": 0, "stdout": "No active lock found (already released?)\n", "stderr": ""}
+    return {"returncode": 0, "stdout": "No lock file to clear (already released?)\n", "stderr": ""}
 
 
 def cmd_compile(bug_id, work_dir=None):

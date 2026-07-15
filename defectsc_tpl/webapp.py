@@ -421,9 +421,12 @@ def d4c_checkout(project: str, sha: str, is_force: bool = False) -> dict:
         return {"returncode": 1, "stdout": "",
                 "stderr": f"Repo dir {repo_dir} has no .git (and no sibling _gittree). Run warmup first."}
 
-    # Always run cmd_checkout to restore the buggy source file(s).
-    # `cmd_checkout` only reverts src_file via `git checkout -f commit_before -- src_file`
-    # — it does NOT touch the build directory, so warmup artifacts are preserved.
+    # Always run cmd_checkout to acquire a slot and FULLY reset it to the clean
+    # buggy baseline: it rsyncs the whole worktree AND git tree from the pristine
+    # per-bug backup (--delete), scrubbing every leftover from a previous holder
+    # (edits to other files, stray files, the agent's own commits). The backup
+    # carries the pre-built build_<sha>/, so warmup artifacts are still reused and
+    # the rebuild stays incremental.
     result = bug_helper.cmd_checkout(bug_id)
     return result  # includes slot_path if provided by bug_helper
 
