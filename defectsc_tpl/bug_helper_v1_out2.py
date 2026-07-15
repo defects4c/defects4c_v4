@@ -479,14 +479,16 @@ def _build_backup(golden, project, sha):
             os.makedirs(tmp, exist_ok=True)
             print(f"[_build_backup] building pristine backup for {project}@{sha}", file=sys.stderr)
             # Copy golden's worktree (NOT the oracle .git, NOT nested slots).
+            # Exclude config.log: it is write-only autoconf diagnostic output
+            # (some projects, e.g. libgd, produce multi-GB config.logs) that is
+            # never needed to build or test and otherwise gets replicated into
+            # the backup and every slot, making rsync crawl.
             subprocess.run(
                 ["rsync", "-a", "--delete", "--exclude=.git",
-                 "--exclude=__s*", "--exclude=*.lock",
+                 "--exclude=__s*", "--exclude=*.lock", "--exclude=config.log",
                  golden + "/", tmp + "/"],
                 check=True, timeout=1800,
             )
-            # cmake absolute paths: golden → backup.
-            _fixup_cmake_paths(golden, tmp, sha)
             # Restore the buggy src_file so the baseline captures the buggy state.
             src_file, content = _git_show_buggy_src(golden, project, sha)
             if src_file and content is not None:
@@ -494,11 +496,20 @@ def _build_backup(golden, project, sha):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 with open(dst, "wb") as f:
                     f.write(content)
-            # Ignore build artifacts / generated scripts, then init baseline git.
-            with open(os.path.join(tmp, ".gitignore"), "w") as f:
-                f.write(_slot_gitignore(sha))
-            _init_slot_git(tmp)
+            # Rename to the FINAL path BEFORE fixing cmake absolute paths, so the
+            # build files are rewritten with the real backup path — not the .tmp
+            # staging path. (Fixing under tmp baked "…__backup.tmp" into build
+            # files; the later backup→slot fixup then left a stray ".tmp" suffix
+            # on source paths and broke incremental builds for projects that use
+            # absolute paths, e.g. nng/php.)
             os.rename(tmp, backup)
+            # cmake/make absolute paths: golden → backup (final path).
+            _fixup_cmake_paths(golden, backup, sha)
+            # Ignore build artifacts / generated scripts, then init baseline git
+            # LAST so the presence of backup/.git marks a fully-built backup.
+            with open(os.path.join(backup, ".gitignore"), "w") as f:
+                f.write(_slot_gitignore(sha))
+            _init_slot_git(backup)
             print(f"[_build_backup] done: {backup}", file=sys.stderr)
             return backup
         finally:
