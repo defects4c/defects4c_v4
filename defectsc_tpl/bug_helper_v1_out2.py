@@ -478,15 +478,32 @@ def _build_backup(golden, project, sha):
                 shutil.rmtree(tmp, ignore_errors=True)
             os.makedirs(tmp, exist_ok=True)
             print(f"[_build_backup] building pristine backup for {project}@{sha}", file=sys.stderr)
-            # Copy golden's worktree (NOT the oracle .git, NOT nested slots).
-            # Exclude config.log: it is write-only autoconf diagnostic output
-            # (some projects, e.g. libgd, produce multi-GB config.logs) that is
-            # never needed to build or test and otherwise gets replicated into
+            # Pick the source tree to snapshot. Normally the golden root holds the
+            # full worktree. A few projects (e.g. mdadams___jasper) never populate
+            # the golden root — the source lives only inside the pool slots (the
+            # reproduce checked out into __s0, not golden). For those, snapshotting
+            # the golden root yields an EMPTY backup, and the reset then wipes the
+            # slot's real source with --delete. Detect that (bug src_file absent at
+            # the golden root) and snapshot the first slot that actually has it.
+            src_file0 = _bug_src_file(project, sha)
+            src_root = golden
+            if src_file0 and not os.path.exists(os.path.join(golden, src_file0)):
+                for i in range(POOL_SIZE):
+                    cand = _slot_dir(golden, i)
+                    if os.path.exists(os.path.join(cand, src_file0)):
+                        src_root = cand
+                        print(f"[_build_backup] golden lacks src; sourcing backup "
+                              f"from slot {cand}", file=sys.stderr)
+                        break
+            # Copy the source worktree (NOT the oracle/baseline .git, NOT nested
+            # slots). Exclude config.log: it is write-only autoconf diagnostic
+            # output (some projects, e.g. libgd, produce multi-GB config.logs) that
+            # is never needed to build or test and otherwise gets replicated into
             # the backup and every slot, making rsync crawl.
             subprocess.run(
                 ["rsync", "-a", "--delete", "--exclude=.git",
                  "--exclude=__s*", "--exclude=*.lock", "--exclude=config.log",
-                 golden + "/", tmp + "/"],
+                 src_root + "/", tmp + "/"],
                 check=True, timeout=1800,
             )
             # Restore the buggy src_file so the baseline captures the buggy state.
@@ -503,8 +520,8 @@ def _build_backup(golden, project, sha):
             # on source paths and broke incremental builds for projects that use
             # absolute paths, e.g. nng/php.)
             os.rename(tmp, backup)
-            # cmake/make absolute paths: golden → backup (final path).
-            _fixup_cmake_paths(golden, backup, sha)
+            # cmake/make absolute paths: source root → backup (final path).
+            _fixup_cmake_paths(src_root, backup, sha)
             # Ignore build artifacts / generated scripts, then init baseline git
             # LAST so the presence of backup/.git marks a fully-built backup.
             with open(os.path.join(backup, ".gitignore"), "w") as f:
@@ -533,12 +550,60 @@ def _restore_from_backup(backup, slot, project, sha):
         check=True, timeout=1800,
     )
     _fixup_cmake_paths(backup, slot, sha)
+    # Build-generator self-heal. The backup carries whatever build_<sha>/ the
+    # golden was configured with. A few projects (e.g. danmar___cppcheck) were
+    # reproduced with the "Unix Makefiles" generator, but the slot's
+    # inplace_rebuild.sh drives `ninja -C build_dir`. Running ninja against a
+    # Makefiles-configured build dir fails ("generator Ninja does not match ...",
+    # or "loading build.ninja: No such file"). If the rebuild script uses a
+    # generator whose build file is absent from the restored build dir, drop the
+    # stale build dir so the rebuild reconfigures from scratch with the right
+    # generator. Conditional: build dirs that already carry the right build file
+    # (the vast majority) are left untouched, preserving incrementality.
+    build_dir = os.path.join(slot, f"build_{sha}")
+    rebuild_sh = os.path.join(slot, "inplace_rebuild.sh")
+    if os.path.isdir(build_dir) and os.path.isfile(rebuild_sh):
+        try:
+            script = open(rebuild_sh, errors="ignore").read()
+        except Exception:
+            script = ""
+        uses_ninja = "ninja " in script or "ninja\t" in script or "ninja -C" in script
+        uses_make = (not uses_ninja) and ("make " in script or "make\t" in script)
+        if uses_ninja and not os.path.isfile(os.path.join(build_dir, "build.ninja")):
+            print(f"[_restore] dropping stale non-ninja build dir: {build_dir}", file=sys.stderr)
+            shutil.rmtree(build_dir, ignore_errors=True)
+        elif uses_make and not os.path.isfile(os.path.join(build_dir, "Makefile")):
+            print(f"[_restore] dropping stale non-make build dir: {build_dir}", file=sys.stderr)
+            shutil.rmtree(build_dir, ignore_errors=True)
     # Touch src file so the rebuild picks up the (re-)restored buggy contents.
     src_file = _bug_src_file(project, sha)
     if src_file:
         fp = os.path.join(slot, src_file)
         if os.path.isfile(fp):
             os.utime(fp, None)
+        # Force a faithful recompile of the mode's source on the next build.
+        # After a cross-path backup restore, ninja/make incremental state
+        # (.ninja_log, recorded mtimes) can be stale enough that the restored
+        # build dir looks up-to-date and the swapped src is NOT recompiled — so
+        # the trigger test would run against the wrong-mode binary. In fix mode
+        # that means testing a still-buggy object, and any test the fix commit
+        # newly added (e.g. arrow WriteHiveWithSlashesInValues, SPIRV
+        # spec_constant_composite) then fails on a build that is actually correct
+        # from scratch. Deleting the src object(s) makes the build unconditionally
+        # rebuild them (a missing output is always regenerated) and relink
+        # dependents. jasper's own rebuild script does this inline; generalize it.
+        base = os.path.splitext(os.path.basename(src_file))[0]
+        obj_names = {base + ext for ext in
+                     (".o", ".c.o", ".cc.o", ".cpp.o", ".cxx.o", ".obj")}
+        bd = os.path.join(slot, f"build_{sha}")
+        if os.path.isdir(bd):
+            for r, _dirs, files in os.walk(bd):
+                for fn in files:
+                    if fn in obj_names:
+                        try:
+                            os.remove(os.path.join(r, fn))
+                        except OSError:
+                            pass
 
 
 def _restore_slot(golden, slot, project, sha):
