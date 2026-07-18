@@ -88,9 +88,8 @@ out=""; rc=0
 for attempt in 1 2 3 4 5 6 7 8; do
 	out=$(timeout -s KILL 120 "$@" 2>&1)
 	rc=$?
-	if printf '%s' "$out" | grep -q 'DEADLYSIGNAL' \
-	   && ! printf '%s' "$out" | grep -qE '==.*ERROR: AddressSanitizer' \
-	   && ! printf '%s' "$out" | grep -qE 'runtime error:|UndefinedBehaviorSanitizer'; then
+	if printf '%s' "$out" | grep -qE 'DEADLYSIGNAL|SEGV on unknown address' \
+	   && ! printf '%s' "$out" | grep -qE 'heap-buffer-overflow|stack-buffer-overflow|global-buffer-overflow|heap-use-after-free|stack-use-after-|use-after-poison|alloc-dealloc-mismatch|double-free|negative-size-param|runtime error:|UndefinedBehaviorSanitizer'; then
 		continue   # ASLR init flake -> retry
 	fi
 	break
@@ -100,7 +99,15 @@ exit $rc
 RETRY
 chmod +x "$RETRY_SH"
 
-make -C tests AUTOMAKE=: AUTOCONF=: ACLOCAL=: AUTOHEADER=: MAKEINFO=: -j {{cpu_count}} CFLAGS="${ASAN_CFLAGS}" CXXFLAGS="${ASAN_CFLAGS}" LDFLAGS="${ASAN_LDFLAGS} -Wl,-rpath,${SLOT_LIB}" check TESTS="$bug_tests" LOG_COMPILER="$RETRY_SH"   2>&1 > $test_log
+# NOTE: `make check` builds the ENTIRE tests/ check_PROGRAMS set (dozens of
+# ASAN+libgd binaries) before running the TESTS= subset. At -j{{cpu_count}}
+# the parallel ASAN links spike memory and get OOM-killed under load, which
+# truncates the build with no verdict (fix=FAIL & buggy=FAIL) -- fb0e0cce
+# flapped this way. Cap parallelism to 4 to bound peak memory; the gunicorn
+# timeout (4000s) leaves ample headroom. Also FIX the redirection order
+# (was `2>&1 > $test_log`, which sent stderr to the terminal and dropped the
+# actual build error) to `> $test_log 2>&1` so failures are captured.
+make -C tests AUTOMAKE=: AUTOCONF=: ACLOCAL=: AUTOHEADER=: MAKEINFO=: -j 4 CFLAGS="${ASAN_CFLAGS}" CXXFLAGS="${ASAN_CFLAGS}" LDFLAGS="${ASAN_LDFLAGS} -Wl,-rpath,${SLOT_LIB}" check TESTS="$bug_tests" check_PROGRAMS="$bug_tests" LOG_COMPILER="$RETRY_SH"   > $test_log 2>&1
 
 
 # FixOnly oracle: buggy must FAIL. Use the authoritative automake result.
