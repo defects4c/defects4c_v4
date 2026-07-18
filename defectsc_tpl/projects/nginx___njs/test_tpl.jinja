@@ -11,24 +11,68 @@ if [[ ! -d $build_dir ]]; then
 fi 
 
 
-make -j {{ cpu_count }}   $build_dir/njs_unit_test > /dev/null   2>&1 
+# njs_unit_test must be linked with ASAN: libnjs.a objects are ASAN-instrumented
+# (see build_tpl.jinja NJS_CFLAGS/NJS_LINK). Without -fsanitize=address on the link
+# line the unit-test binary fails to link (undefined __asan_* refs) and the
+# discriminating CVE test case never runs -> both fix and buggy wrongly "pass".
+NJS_ASAN_CFLAGS="-pipe -fPIC -fvisibility=hidden -O -W -Wall -Wextra -Wno-unused-parameter -Wwrite-strings -Wmissing-prototypes -Werror -g -O -fsanitize=address -fno-omit-frame-pointer"
+make -j {{ cpu_count }}   $build_dir/njs_unit_test   NJS_CFLAGS="$NJS_ASAN_CFLAGS"   NJS_LINK="gcc -fsanitize=address" > /dev/null   2>&1 
 
 
 rm -fr defect4c_asan 
 mkdir -p defect4c_asan 
+
+# --- ASAN/ASLR init-crash mitigation (added 2026-07-18) ---
+# The container inherits vm.mmap_rnd_bits=32, too high for ASAN's shadow-memory
+# layout, so an ASAN-instrumented binary SEGVs at startup ~15-25% of runs:
+# "AddressSanitizer:DEADLYSIGNAL" loops with NO "==ERROR" report and the tests
+# never start. setarch -R (disable ASLR) is blocked by the container seccomp
+# profile (EPERM), so instead retry the process until it starts cleanly.
+# A genuine ASAN error report (==ERROR) or a completed run (TOTAL:) is accepted
+# on the first try and never retried, so real buggy failures are preserved.
+run_asan() {  # usage: run_asan <timeout_secs> <binary> [args...]
+	local tmo="$1"; shift
+	local out="" rc=0 attempt
+	for attempt in 1 2 3 4 5 6 7 8; do
+		out=$(ASAN_OPTIONS="halt_on_error=1:detect_leaks=0" timeout "$tmo" "$@" 2>&1 | head -c 4000000)
+		rc=${PIPESTATUS[0]}
+		if echo "$out" | grep -q 'DEADLYSIGNAL' \
+		   && ! echo "$out" | grep -qE '==.*ERROR: AddressSanitizer' \
+		   && ! echo "$out" | grep -q 'TOTAL:' ; then
+			continue   # ASLR init flake -> retry
+		fi
+		break
+	done
+	printf '%s' "$out" >> "$test_log"
+	return $rc
+}
 
 
 {% for test_file in test_files %}
 
 	{% if test_file.endswith(".c") %}
 	
-		ASAN_OPTIONS="log_path=defect4c_asan/asan.log"			$build_dir/njs_unit_test    >>  $test_log 2>&1 
-		cat defect4c_asan/asan.log* >> $test_log
+		# Bound the run: a buggy njs may infinite-recurse and spew GBs of ASAN output.
+		# timeout->124 (treated as failure). Cap captured output to keep logs sane.
+		# Pipe through head: caps disk usage AND sends SIGPIPE once 4MB seen, which stops
+		# a buggy njs_unit_test that loops on SIGSEGV (ASAN DEADLYSIGNAL) instead of waiting
+		# out the full timeout. timeout is the hard backstop for a genuine hang.
+		run_asan 600 $build_dir/njs_unit_test
+		ut_rc=$?
+		if [ $ut_rc -eq 124 ]; then echo "NJS_UNIT_TEST_TIMEOUT rc=124" >> $test_log; fi
+		if [ $ut_rc -ne 0 ] && [ $ut_rc -ne 124 ] && [ $ut_rc -ne 141 ]; then echo "NJS_UNIT_TEST_NONZERO rc=$ut_rc" >> $test_log; fi
+		if [ $ut_rc -eq 141 ]; then echo "NJS_UNIT_TEST_SIGPIPE rc=141" >> $test_log; fi
 		
 		 
 		
 	{% else %}
-		$build_dir/njs {{test_file}}   >>  $test_log 2>&1 
+		# Bound the njs shell run: a buggy njs may loop on SIGSEGV (ASAN DEADLYSIGNAL)
+		# and spew GBs. halt_on_error=1 + timeout keep it bounded; cap captured output.
+		run_asan 300 $build_dir/njs {{test_file}}
+		njs_rc=$?
+		if [ $njs_rc -eq 124 ]; then echo "NJS_SHELL_TIMEOUT rc=124" >> $test_log; fi
+		if [ $njs_rc -gt 128 ] && [ $njs_rc -ne 141 ]; then echo "NJS_SHELL_SIGNAL rc=$njs_rc" >> $test_log; fi
+		if [ $njs_rc -eq 141 ]; then echo "NJS_SHELL_SIGPIPE rc=141" >> $test_log; fi
 	{% endif %}
 
 {% endfor %}  
@@ -40,7 +84,7 @@ mkdir -p defect4c_asan
 get_status() {
 	string=$(cat $fn)
 	
-        if [[ $string == *"==ERROR"* ]] || [[ $string == *"AddressSanitizer:"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] ; then	    echo "FAILED\n"
+        if [[ $string == *"==ERROR"* ]] || [[ $string == *"AddressSanitizer:"* ]] || [[ $string == *"SIGSEGV, Segmentation fault"* ]] || [[ $string == *"TOTAL: FAILED"* ]] || [[ $string == *"NJS_UNIT_TEST_TIMEOUT"* ]] || [[ $string == *"NJS_UNIT_TEST_NONZERO"* ]] || [[ $string == *"NJS_SHELL_TIMEOUT"* ]] || [[ $string == *"NJS_SHELL_SIGNAL"* ]] || [[ $string == *"NJS_UNIT_TEST_SIGPIPE"* ]] || [[ $string == *"NJS_SHELL_SIGPIPE"* ]] ; then	    echo "FAILED\n"
 	    
 	else
 	    echo "success\n"

@@ -1,30 +1,144 @@
 build_dir=$1
-test_log=$2 
+test_log=$2
 fn=$(realpath $test_log )
 
 cat /dev/null > $test_log
- 
-
-make CFLALGS="-Wno-error " -j {{cpu_count}} check   2>&1 > $test_log 
 
 
+# Compile + link the test binaries with AddressSanitizer (the lib was built with
+# it in build_tpl). On the first detected error ASAN exits non-zero so automake
+# records the offending test as FAIL.
+ASAN_CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -Wno-error"
+ASAN_LDFLAGS="-fsanitize=address"
+# CVE-2016-10168 (69d2fd2c): the library was built with UBSan signed-integer-
+# overflow in build_tpl; instrument the test binary the same way so the abort
+# from the buggy nc=(*ncx)*(*ncy) multiply is produced and recorded as FAIL.
+if [[ $test_log =~ "69d2fd2c597ffc0c217de1238b9bf4d4bceba8e6" ]]; then
+	UBSAN_EXTRA="-fsanitize=signed-integer-overflow -fno-sanitize-recover=all"
+	ASAN_CFLAGS="${ASAN_CFLAGS} ${UBSAN_EXTRA}"
+	ASAN_LDFLAGS="${ASAN_LDFLAGS} ${UBSAN_EXTRA}"
+fi
+# Make ASAN deterministically ABORT with a non-zero exit on the FIRST memory
+# error. handle_segv/handle_sigbus stop a wild OOB read from re-entering the
+# signal handler forever (the "DEADLYSIGNAL" loop that otherwise dumps GBs of
+# output and only gets killed by the timeout). A clean abort => non-zero exit =>
+# automake records the buggy commit as FAIL, every run.
+export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:exitcode=1:halt_on_error=1:handle_segv=1:handle_sigbus=1:handle_abort=1:disable_coredump=1"
+# UBSan: a signed-integer-overflow must HALT and ABORT with a non-zero exit so
+# automake records the buggy commit as FAIL (with -fno-sanitize-recover the
+# overflow is already fatal; these options also stop any recoverable diagnostic
+# from being merely printed).
+export UBSAN_OPTIONS="halt_on_error=1:abort_on_error=1:print_stacktrace=1"
 
+# CRITICAL: force the test binaries to load the freshly-built, ASAN-instrumented
+# libgd from the slot (src/.libs) instead of the stable SYSTEM libgd in
+# /lib/x86_64-linux-gnu. Without this the test links the distro libgd.so.3, the
+# slot's buggy/fixed gd source is NEVER executed, and every buggy commit is
+# wrongly recorded as PASS. Point both the loader and libtool at the slot lib.
+SLOT_LIB="$(realpath src/.libs 2>/dev/null)"
+export LD_LIBRARY_PATH="${SLOT_LIB}:${LD_LIBRARY_PATH:-}"
+
+
+# Build the base test-name list from test_flags. The flags may name per-data
+# variants (tga/heap_overflow_1, gd2/bug00354a) while the actual built binary is
+# the combined base (tga/heap_overflow, gd2/bug00354). For each flag try the
+# flag itself, the flag without a trailing _<digits>, and without a trailing
+# single lowercase letter; keep only candidates that are REAL test targets
+# (a tests/<cand>.c source exists), de-duplicated, so automake does not fail on
+# non-existent TESTS= entries.
+declare -A seen
+bug_tests=""
+{% for tf in test_flags %}
+for cand in "{{tf}}" "$(echo {{tf}} | sed -E 's/_[0-9]+$//')" "$(echo {{tf}} | sed -E 's/[a-z]$//')" ; do
+	if [[ -f "tests/${cand}.c" ]] && [[ -z "${seen[$cand]:-}" ]]; then
+		seen[$cand]=1; bug_tests="$bug_tests $cand"
+	fi
+done
+{% endfor %}
+bug_tests=$(echo $bug_tests | xargs)
+if [[ -z "$bug_tests" ]]; then bug_tests="{{test_flags[0]}}"; fi
+
+
+# Remove any stale per-test artifacts (.log/.trs) and object/binary from a
+# previous build so the result is freshly produced by this run.
+for cand in $bug_tests; do
+	rm -f "tests/${cand}.log" "tests/${cand}.trs" "tests/${cand}" "tests/${cand}.o" \
+		"tests/$(dirname $cand)/.libs/$(basename $cand)" "tests/.libs/$(basename $cand)" 2>/dev/null || true
+done
+rm -f tests/test-suite.log 2>/dev/null || true
+
+
+# Run ONLY the bug-specific test(s) in tests/ (fast; avoids unrelated
+# pre-existing image-diff failures). A per-test "timeout" guard (LOG_COMPILER)
+# bounds the run: a buggy commit that loops forever on a corrupt read, or an
+# ASAN abort that re-enters, is killed and recorded as a non-zero exit = FAIL
+# instead of hanging the harness. Produces tests/test-suite.log.
+# --- ASAN/ASLR init-crash retry wrapper (added 2026-07-18) ---
+# The container inherits vm.mmap_rnd_bits=32, too high for ASAN's shadow memory,
+# so an ASAN-instrumented test binary SEGVs at startup ~15-25% of runs
+# ("AddressSanitizer:DEADLYSIGNAL", no ==ERROR report, the test never runs) and
+# a healthy fix is wrongly recorded FAIL. setarch -R (disable ASLR) is blocked by
+# the container seccomp profile, so wrap automake's LOG_COMPILER to retry the
+# test binary until it starts cleanly. A genuine ASAN/UBSan error report or a
+# normal completion is accepted on the first try, so real buggy failures stand.
+RETRY_SH="$(pwd)/defect4c_asan_retry.sh"
+cat > "$RETRY_SH" <<'RETRY'
+#!/bin/bash
+out=""; rc=0
+for attempt in 1 2 3 4 5 6 7 8; do
+	out=$(timeout -s KILL 120 "$@" 2>&1)
+	rc=$?
+	if printf '%s' "$out" | grep -q 'DEADLYSIGNAL' \
+	   && ! printf '%s' "$out" | grep -qE '==.*ERROR: AddressSanitizer' \
+	   && ! printf '%s' "$out" | grep -qE 'runtime error:|UndefinedBehaviorSanitizer'; then
+		continue   # ASLR init flake -> retry
+	fi
+	break
+done
+printf '%s\n' "$out"
+exit $rc
+RETRY
+chmod +x "$RETRY_SH"
+
+make -C tests AUTOMAKE=: AUTOCONF=: ACLOCAL=: AUTOHEADER=: MAKEINFO=: -j {{cpu_count}} CFLAGS="${ASAN_CFLAGS}" CXXFLAGS="${ASAN_CFLAGS}" LDFLAGS="${ASAN_LDFLAGS} -Wl,-rpath,${SLOT_LIB}" check TESTS="$bug_tests" LOG_COMPILER="$RETRY_SH"   2>&1 > $test_log
+
+
+# FixOnly oracle: buggy must FAIL. Use the authoritative automake result.
 get_status() {
-	string=$(grep -E '^FAIL: {{test_flags[0]}}' tests/test-suite.log )
-	
-	if [[ -z $string  ]]; then
-	    echo "success\n"
+	local failed=0
+	for cand in $bug_tests; do
+		# Per-test result file (.trs), regenerated each run.
+		if [[ -f "tests/${cand}.trs" ]] && grep -qE "^:(global-)?test-result:[[:space:]]*(FAIL|ERROR|XPASS)" "tests/${cand}.trs" 2>/dev/null; then
+			failed=1
+		fi
+		# Automake summary line.
+		if grep -qE "^(FAIL|ERROR): ${cand}([[:space:]]|$)" tests/test-suite.log 2>/dev/null; then
+			failed=1
+		fi
+		# Non-zero exit / crash recorded in the freshly written per-test log.
+		if [[ -f "tests/${cand}.log" ]] && grep -qE "^FAIL ${cand}( |$)|exit status: [1-9]" "tests/${cand}.log" 2>/dev/null; then
+			failed=1
+		fi
+		# Sanitizer abort (ASAN memory error or UBSan signed-integer-overflow)
+		# recorded in the per-test log => FAIL.
+		if [[ -f "tests/${cand}.log" ]] && grep -qE "runtime error: signed integer overflow|AddressSanitizer|UndefinedBehaviorSanitizer" "tests/${cand}.log" 2>/dev/null; then
+			failed=1
+		fi
+	done
+
+	if [[ $failed -eq 1 ]]; then
+		echo "FAILED\n"
 	else
-	    echo "FAILED\n"
-	fi	
+		echo "success\n"
+	fi
 }
 
 get_err_msg() {
-	if [[ -f tests/test-suite.log ]]; then 
-        cat tests/test-suite.log  > $1 
+	if [[ -f tests/test-suite.log ]]; then
+        cat tests/test-suite.log  > $1
     else
-        cat ./test-suite.log  > $1 
-    fi 
+        cat ./test-suite.log  > $1 2>/dev/null || true
+    fi
 }
 
 
@@ -38,5 +152,4 @@ status_log=$( get_status)
 echo $status_log > "${fix_log}.status"
 
 
-get_err_msg "${fix_log}.msg" 
-
+get_err_msg "${fix_log}.msg"
