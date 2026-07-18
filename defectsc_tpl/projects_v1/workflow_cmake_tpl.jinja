@@ -29,7 +29,7 @@ mkdir -p $test_log_dirname
 bash  inplace_build.sh {{build_dir}} {{test_log}} || { echo "Command 1 failed"; exit 1; }
 
 
-bash inplace_test.sh  {{build_dir}}  {{test_log}}
+setarch -R bash inplace_test.sh  {{build_dir}}  {{test_log}}
 
 
 
@@ -41,7 +41,7 @@ bash inplace_test.sh  {{build_dir}}  {{test_log}}
 
 bash  inplace_rebuild.sh {{build_dir}} {{test_log| replace("_fix.log", "_buggy.log") }} || { echo "Command 2 failed"; exit 1; }
 
-bash inplace_test.sh  {{build_dir}}   {{test_log| replace("_fix.log", "_buggy.log") }}
+setarch -R bash inplace_test.sh  {{build_dir}}   {{test_log| replace("_fix.log", "_buggy.log") }}
 
 
 

@@ -8,6 +8,14 @@ services:
       - ./patche_dirs:/patches
       - ./workspace:/workspace
       - ./defectsc_tpl:/src
+    # ASAN-instrumented test binaries SEGV at startup ~15-25% of runs because the
+    # host kernel's vm.mmap_rnd_bits=32 is too high for ASAN's shadow-memory
+    # layout. The clean fix is to disable ASLR per test process with `setarch -R`,
+    # but the personality(ADDR_NO_RANDOMIZE) syscall is blocked by Docker's default
+    # seccomp profile (EPERM). Unconfining seccomp lets setarch disable ASLR so the
+    # ASAN startup SEGV cannot occur. Internal validation container; no untrusted input.
+    security_opt:
+      - seccomp:unconfined
     environment:
       - SRC_DIR=/src
       - ROOT_DIR=/out
