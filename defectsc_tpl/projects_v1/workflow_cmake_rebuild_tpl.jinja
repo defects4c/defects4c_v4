@@ -1,6 +1,10 @@
 export CXX=clang++ 
 export CC=clang 
 
+# d4c-guard: cap single-file size so a looping buggy binary can't fill the disk
+# (unit = 1024-byte blocks; 8388608 = 8 GiB). SIGXFSZ kills the writer past this.
+ulimit -f 8388608 2>/dev/null || true
+
 
 patch_files=$1
 

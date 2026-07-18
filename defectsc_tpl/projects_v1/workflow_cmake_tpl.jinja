@@ -1,5 +1,9 @@
-export CXX=clang++ 
-export CC=clang 
+export CXX=clang++
+export CC=clang
+
+# d4c-guard: cap single-file size so a looping buggy binary can't fill the disk
+# (unit = 1024-byte blocks; 8388608 = 8 GiB). SIGXFSZ kills the writer past this.
+ulimit -f 8388608 2>/dev/null || true
 
 {%for env_item in env %}
 	export {{env_item}}
@@ -10,8 +14,12 @@ cd {{repo_dir}}
 
 
 
-git  --work-tree={{repo_dir}} --git-dir={{_git_tree}} checkout -f {{commit_after}} 
-git  --work-tree={{repo_dir}} --git-dir={{_git_tree}} checkout -f {{commit_after}} -- {{src_file}}  
+{% if gittree_dir %}git --git-dir={{gittree_dir}}/.git --work-tree={{repo_dir}} checkout -f {{commit_after}}
+{% else %}git -C {{repo_dir}} checkout -f {{commit_after}}
+{% endif %}
+{% if gittree_dir %}git --git-dir={{gittree_dir}}/.git --work-tree={{repo_dir}} checkout -f {{commit_after}} -- {{src_file}}
+{% else %}git -C {{repo_dir}} checkout -f {{commit_after}} -- {{src_file}}
+{% endif %}
 
 
 test_log_dirname=$(dirname  {{test_log}} )
@@ -21,17 +29,19 @@ mkdir -p $test_log_dirname
 bash  inplace_build.sh {{build_dir}} {{test_log}} || { echo "Command 1 failed"; exit 1; }
 
 
-bash inplace_test.sh  {{build_dir}}  {{test_log}} 
+bash inplace_test.sh  {{build_dir}}  {{test_log}}
 
 
 
 
-git  --work-tree={{repo_dir}} --git-dir={{_git_tree}} checkout -f {{commit_before}} -- {{src_file}} 
+{% if gittree_dir %}git --git-dir={{gittree_dir}}/.git --work-tree={{repo_dir}} checkout -f {{commit_before}} -- {{src_file}}
+{% else %}git -C {{repo_dir}} checkout -f {{commit_before}} -- {{src_file}}
+{% endif %}
 
 
 bash  inplace_rebuild.sh {{build_dir}} {{test_log| replace("_fix.log", "_buggy.log") }} || { echo "Command 2 failed"; exit 1; }
 
-bash inplace_test.sh  {{build_dir}}   {{test_log| replace("_fix.log", "_buggy.log") }} 
+bash inplace_test.sh  {{build_dir}}   {{test_log| replace("_fix.log", "_buggy.log") }}
 
 
 
@@ -39,4 +49,3 @@ bash inplace_test.sh  {{build_dir}}   {{test_log| replace("_fix.log", "_buggy.lo
 
 USERNAME="defects4c_user"
 chown -R "$USERNAME:$USERNAME" ./ || true
-
